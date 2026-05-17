@@ -1,4 +1,13 @@
-# Malai-XD-2.0 Asaia Mega WhatsApp Bot
+# Malai-XD-2.0  WhatsApp Bot
+
+## 🔗 Pairing Site
+**Use the official pairing site to get your session:** [https://malai-pairing-site-0e06.onrender.com](https://malai-pairing-site-0e06.onrender.com)
+
+1. Open the link above
+2. Enter your WhatsApp number (international format, e.g. `254700000000`)
+3. Copy the pairing code shown
+4. In WhatsApp: **Settings → Linked Devices → Link a Device → Link with Phone Number**
+5. Enter the code — your `creds.json` is saved in the `session/` folder automatically
 
 **Version 1.0.5 Malai build:** pairing remains fixed, and this build adds the branded image menu, `⭐ Made by Kimani Samuel ⭐` menu footer, autobio, runtime prefix switching, block/unblock, add/kick/promote/demote by number or mention, pending join request approval, richer group info with group DP, owner contact, settings toggles, private greet, command reactions, autostatus reactions, YouTube audio/video downloads, and connected notifications.
 
