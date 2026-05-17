@@ -17,13 +17,35 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore
+  makeCacheableSignalKeyStore,
+  downloadContentFromMessage
 } = await import('@whiskeysockets/baileys');
 
 const { commands, registry, getConfig, getState } = buildCommands();
 const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 const sessionDir = process.env.SESSION_DIR || './session';
 fs.mkdirSync(sessionDir, { recursive: true });
+
+// ─── Message store for antidelete ─────────────────────────────────────────────
+const messageStore = new Map();
+const ANTIDELETE_TMP_DIR = path.join(process.cwd(), 'data', 'antidelete_tmp');
+fs.mkdirSync(ANTIDELETE_TMP_DIR, { recursive: true });
+
+// Periodic cleanup of antidelete tmp dir (>200MB or files >1hr)
+setInterval(() => {
+  try {
+    const files = fs.readdirSync(ANTIDELETE_TMP_DIR);
+    let total = 0;
+    for (const f of files) {
+      try { total += fs.statSync(path.join(ANTIDELETE_TMP_DIR, f)).size; } catch {}
+    }
+    if (total > 200 * 1024 * 1024) {
+      for (const f of files) {
+        try { fs.unlinkSync(path.join(ANTIDELETE_TMP_DIR, f)); } catch {}
+      }
+    }
+  } catch {}
+}, 60 * 1000);
 
 let activePairingManager = null;
 const pendingGreetTimers = new Map();
@@ -101,7 +123,6 @@ function isOwnerJid(jid) {
   return sudo.includes(sender);
 }
 
-
 function chatIsPrivate(chatId = '') {
   return chatId.endsWith('@s.whatsapp.net') || chatId.endsWith('@lid');
 }
@@ -175,7 +196,6 @@ function schedulePrivateGreet(sock, message, chatId, sender, fromMe) {
   if (!isToggleEnabled(state, 'greet')) return;
   if (!chatIsPrivate(chatId) || chatId === 'status@broadcast') return;
 
-  // A reply from the owner/bot in this private chat cancels the pending auto-greet.
   if (fromMe || isOwnerJid(sender)) {
     cancelPrivateGreet(chatId);
     return;
@@ -253,6 +273,406 @@ async function sendError(sock, chatId, message, err) {
   await sock.sendMessage(chatId, { text: `Command failed: ${err.message || err}` }, { quoted: message }).catch(() => {});
 }
 
+// ─── ANTILINK: Detect and handle links in group messages ─────────────────────
+async function handleLinkDetection(sock, message, chatId, sender, text, state) {
+  if (!chatId.endsWith('@g.us')) return;
+  if (!isToggleEnabled(state, 'antilink')) return;
+  if (isOwnerJid(sender)) return; // don't enforce on owner
+  // Check if sender is admin
+  try {
+    const adminCheck = await isAdmin(sock, chatId, sender);
+    if (adminCheck) return; // admins are exempt
+  } catch {}
+
+  const linkPatterns = [
+    /chat\.whatsapp\.com\/[A-Za-z0-9]{20,}/i,
+    /wa\.me\/[A-Za-z0-9+]+/i,
+    /t\.me\/[A-Za-z0-9_]+/i,
+    /https?:\/\/\S+/i,
+    /www\.\S+\.[a-z]{2,}/i
+  ];
+
+  const hasLink = linkPatterns.some(p => p.test(text));
+  if (!hasLink) return;
+
+  try {
+    await sock.sendMessage(chatId, {
+      delete: { remoteJid: chatId, fromMe: false, id: message.key.id, participant: sender }
+    });
+    await sock.sendMessage(chatId, {
+      text: `⚠️ @${normalizeNumber(sender)}, links are not allowed in this group!`,
+      mentions: [sender]
+    });
+  } catch (err) {
+    console.warn('Antilink action failed:', err.message || err);
+  }
+}
+
+// ─── ANTITAG / ANTIGROUPMENTION: Detect mass tagall ──────────────────────────
+async function handleTagDetection(sock, message, chatId, sender, state) {
+  if (!chatId.endsWith('@g.us')) return;
+  const antitagOn = isToggleEnabled(state, 'antitag');
+  const antigroupmentionOn = isToggleEnabled(state, 'antigroupmention');
+  if (!antitagOn && !antigroupmentionOn) return;
+  if (isOwnerJid(sender)) return;
+  try {
+    const adminCheck = await isAdmin(sock, chatId, sender);
+    if (adminCheck) return;
+  } catch {}
+
+  const msg = message.message || {};
+  const mentionedJidsArr = (
+    msg.extendedTextMessage?.contextInfo?.mentionedJid ||
+    msg.imageMessage?.contextInfo?.mentionedJid ||
+    msg.videoMessage?.contextInfo?.mentionedJid || []
+  );
+  const msgText = (
+    msg.conversation ||
+    msg.extendedTextMessage?.text ||
+    msg.imageMessage?.caption ||
+    msg.videoMessage?.caption || ''
+  );
+  const numericMentions = (msgText.match(/@\d{8,}/g) || []).length;
+  const totalMentions = Math.max(mentionedJidsArr.length, numericMentions);
+
+  if (totalMentions < 3) return;
+
+  try {
+    const meta = await sock.groupMetadata(chatId);
+    const threshold = Math.ceil((meta.participants?.length || 10) * 0.5);
+    if (totalMentions < threshold && numericMentions < 10) return;
+
+    // Delete the message
+    await sock.sendMessage(chatId, {
+      delete: { remoteJid: chatId, fromMe: false, id: message.key.id, participant: sender }
+    });
+    await sock.sendMessage(chatId, {
+      text: `⚠️ @${normalizeNumber(sender)}, mass tagging is not allowed!`,
+      mentions: [sender]
+    });
+  } catch (err) {
+    console.warn('Antitag action failed:', err.message || err);
+  }
+}
+
+// ─── ANTIDELETE: Store messages for recovery ──────────────────────────────────
+async function storeMessageForAntidelete(sock, message, state) {
+  if (!isToggleEnabled(state, 'antidelete')) return;
+  if (!message.key?.id) return;
+  const fromMe = Boolean(message.key.fromMe);
+  if (fromMe) return; // don't store own messages
+
+  const messageId = message.key.id;
+  const sender = message.key.participant || message.key.remoteJid;
+  let content = '';
+  let mediaType = '';
+  let mediaPath = '';
+
+  try {
+    const msg = message.message || {};
+    if (msg.conversation) {
+      content = msg.conversation;
+    } else if (msg.extendedTextMessage?.text) {
+      content = msg.extendedTextMessage.text;
+    } else if (msg.imageMessage) {
+      mediaType = 'image';
+      content = msg.imageMessage.caption || '';
+      try {
+        const stream = await downloadContentFromMessage(msg.imageMessage, 'image');
+        let buf = Buffer.from([]);
+        for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+        mediaPath = path.join(ANTIDELETE_TMP_DIR, `${messageId}.jpg`);
+        fs.writeFileSync(mediaPath, buf);
+      } catch {}
+    } else if (msg.videoMessage) {
+      mediaType = 'video';
+      content = msg.videoMessage.caption || '';
+      try {
+        const stream = await downloadContentFromMessage(msg.videoMessage, 'video');
+        let buf = Buffer.from([]);
+        for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+        mediaPath = path.join(ANTIDELETE_TMP_DIR, `${messageId}.mp4`);
+        fs.writeFileSync(mediaPath, buf);
+      } catch {}
+    } else if (msg.audioMessage) {
+      mediaType = 'audio';
+      try {
+        const stream = await downloadContentFromMessage(msg.audioMessage, 'audio');
+        let buf = Buffer.from([]);
+        for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+        mediaPath = path.join(ANTIDELETE_TMP_DIR, `${messageId}.mp3`);
+        fs.writeFileSync(mediaPath, buf);
+      } catch {}
+    } else if (msg.stickerMessage) {
+      mediaType = 'sticker';
+      try {
+        const stream = await downloadContentFromMessage(msg.stickerMessage, 'sticker');
+        let buf = Buffer.from([]);
+        for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+        mediaPath = path.join(ANTIDELETE_TMP_DIR, `${messageId}.webp`);
+        fs.writeFileSync(mediaPath, buf);
+      } catch {}
+    }
+
+    messageStore.set(messageId, {
+      messageId,
+      content, mediaType, mediaPath, sender,
+      chatId: message.key.remoteJid,
+      timestamp: Date.now()
+    });
+
+    // Prune old entries (keep last 500)
+    if (messageStore.size > 500) {
+      const oldest = [...messageStore.keys()].slice(0, messageStore.size - 500);
+      for (const k of oldest) messageStore.delete(k);
+    }
+  } catch (err) {
+    console.warn('storeMessageForAntidelete error:', err.message || err);
+  }
+}
+
+// ─── ANTIDELETE: Handle deleted messages ──────────────────────────────────────
+async function handleAntidelete(sock, deletionMessage, state) {
+  if (!isToggleEnabled(state, 'antidelete')) return;
+
+  let messageId, deletedBy;
+  try {
+    // protocolMessage type 0 = message revocation
+    messageId = deletionMessage.message?.protocolMessage?.key?.id;
+    deletedBy = deletionMessage.key?.participant || deletionMessage.key?.remoteJid;
+  } catch {
+    return;
+  }
+  if (!messageId) return;
+
+  const cfg = getConfig();
+  const ownerJid = `${normalizeNumber(cfg.ownerNumber || OWNER_NUMBER)}@s.whatsapp.net`;
+  const botNumber = normalizeNumber(sock.user?.id || sock.user?.jid || '');
+
+  // Don't report if owner/bot deleted their own message
+  if (deletedBy && (normalizeNumber(deletedBy) === botNumber)) return;
+
+  const original = messageStore.get(messageId);
+  if (!original) return;
+
+  const sender = original.sender;
+  const time = new Date().toLocaleString('en-US', {
+    timeZone: cfg.timeZone || 'Africa/Nairobi',
+    hour12: true, hour: '2-digit', minute: '2-digit',
+    day: '2-digit', month: '2-digit', year: 'numeric'
+  });
+
+  let groupName = '';
+  if (original.chatId?.endsWith('@g.us')) {
+    try {
+      const meta = await sock.groupMetadata(original.chatId);
+      groupName = meta.subject || '';
+    } catch {}
+  }
+
+  let reportText = `*🔰 ANTIDELETE REPORT 🔰*\n\n` +
+    `*🗑️ Deleted By:* @${normalizeNumber(deletedBy || sender)}\n` +
+    `*👤 Sender:* @${normalizeNumber(sender)}\n` +
+    `*🕒 Time:* ${time}\n`;
+  if (groupName) reportText += `*👥 Group:* ${groupName}\n`;
+  if (original.content) reportText += `\n*💬 Deleted Message:*\n${original.content}`;
+
+  try {
+    await sock.sendMessage(ownerJid, {
+      text: reportText,
+      mentions: [deletedBy, sender].filter(Boolean)
+    });
+
+    if (original.mediaType && original.mediaPath && fs.existsSync(original.mediaPath)) {
+      const caption = `*Deleted ${original.mediaType}*\nFrom: @${normalizeNumber(sender)}`;
+      const opts = { caption, mentions: [sender] };
+      switch (original.mediaType) {
+        case 'image':
+          await sock.sendMessage(ownerJid, { image: { url: original.mediaPath }, ...opts });
+          break;
+        case 'video':
+          await sock.sendMessage(ownerJid, { video: { url: original.mediaPath }, ...opts });
+          break;
+        case 'audio':
+          await sock.sendMessage(ownerJid, { audio: { url: original.mediaPath }, mimetype: 'audio/mpeg', ptt: false });
+          break;
+        case 'sticker':
+          await sock.sendMessage(ownerJid, { sticker: { url: original.mediaPath } });
+          break;
+      }
+      try { fs.unlinkSync(original.mediaPath); } catch {}
+    }
+    messageStore.delete(messageId);
+  } catch (err) {
+    console.warn('Antidelete report failed:', err.message || err);
+  }
+}
+
+// ─── ANTIDELETE STATUS: Detect deleted status updates ────────────────────────
+async function handleAntideleteStatus(sock, message, state) {
+  if (!isToggleEnabled(state, 'antidelete_status')) return;
+  const chatId = message.key?.remoteJid;
+  if (chatId !== 'status@broadcast') return;
+  const isProtocol = message.message?.protocolMessage?.type === 0;
+  if (!isProtocol) return;
+
+  const cfg = getConfig();
+  const ownerJid = `${normalizeNumber(cfg.ownerNumber || OWNER_NUMBER)}@s.whatsapp.net`;
+  const deletedBy = message.key?.participant || message.key?.remoteJid;
+
+  try {
+    await sock.sendMessage(ownerJid, {
+      text: `*🗑️ Status Deleted*\nSomeone (@${normalizeNumber(deletedBy)}) deleted their status.`,
+      mentions: [deletedBy].filter(Boolean)
+    });
+  } catch {}
+}
+
+// ─── VIEW-ONCE AUTO-FORWARD ─────────────────────────────────────────────────
+async function handleViewOnceAutoForward(sock, rawMessage) {
+  try {
+    const st = getState();
+    if (st.groupSettings?._vv2 === false) return;
+    const message = unwrapMessage(rawMessage);
+    if (!message?.message) return;
+    const chatId = message.key.remoteJid;
+    const fromMe = Boolean(message.key.fromMe);
+    if (fromMe) return;
+    const sender = message.key.participant || message.key.remoteJid;
+    const msg = message.message;
+    const viewOnceMsg = msg.viewOnceMessage?.message || msg.viewOnceMessageV2?.message || msg.viewOnceMessageV2Extension?.message;
+    if (!viewOnceMsg) return;
+    const imgMsg = viewOnceMsg.imageMessage;
+    const vidMsg = viewOnceMsg.videoMessage;
+    if (!imgMsg && !vidMsg) return;
+
+    const cfg = getConfig();
+    const ownerJid = `${normalizeNumber(cfg.ownerNumber || OWNER_NUMBER)}@s.whatsapp.net`;
+    const selfJid = sock.user?.id || sock.user?.jid || ownerJid;
+
+    const senderNumber = `+${normalizeNumber(sender)}`;
+    const senderName = message.pushName || senderNumber;
+    const isGroup = chatId.endsWith('@g.us');
+    let source = 'Private DM';
+    if (isGroup) {
+      try {
+        const meta = await sock.groupMetadata(chatId);
+        source = `Group: ${meta.subject}`;
+      } catch { source = `Group: ${chatId}`; }
+    }
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('en-GB', { timeZone: cfg.timeZone || 'Africa/Nairobi', day: '2-digit', month: 'short', year: 'numeric' });
+    const timeStr = now.toLocaleTimeString('en-GB', { timeZone: cfg.timeZone || 'Africa/Nairobi', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    const caption = `📸 *View-Once Received*\n\n👤 *Sender:* ${senderName}\n📞 *Number:* ${senderNumber}\n📍 *From:* ${source}\n📅 *Date:* ${dateStr}\n⏰ *Time:* ${timeStr}`;
+
+    if (imgMsg) {
+      const stream = await downloadContentFromMessage(imgMsg, 'image');
+      let buf = Buffer.from([]);
+      for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+      await sock.sendMessage(selfJid, { image: buf, caption });
+    } else if (vidMsg) {
+      const stream = await downloadContentFromMessage(vidMsg, 'video');
+      let buf = Buffer.from([]);
+      for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+      await sock.sendMessage(selfJid, { video: buf, caption });
+    }
+  } catch {}
+}
+
+// ─── WELCOME ─────────────────────────────────────────────────────────────────
+async function handleGroupWelcome(sock, groupId, participants) {
+  const cfg = getConfig();
+  let meta;
+  try { meta = await sock.groupMetadata(groupId); } catch { return; }
+  const groupName = meta.subject;
+  const groupDesc = meta.desc || 'No description available.';
+  const memberCount = meta.participants?.length || 0;
+
+  for (const participant of participants) {
+    const jidStr = typeof participant === 'string' ? participant : (participant.id || participant.toString());
+    const number = `+${normalizeNumber(jidStr)}`;
+    const pushName = (typeof participant === 'object' && participant.pushName) || number;
+
+    let ppBuffer = null;
+    try {
+      const ppUrl = await sock.profilePictureUrl(jidStr, 'image');
+      if (ppUrl) {
+        const { data } = await axios.get(ppUrl, { responseType: 'arraybuffer', timeout: 10000 });
+        ppBuffer = Buffer.from(data);
+      }
+    } catch {}
+
+    const welcomeMsg = `╭╼━≪• 🎉 *WELCOME* •≫━╾╮
+┃ 👋 Hello *${pushName}*!
+┃ 📞 Number: ${number}
+┃ 🏡 Group: *${groupName}*
+┃ 👥 Members: *${memberCount}*
+╰━━━━━━━━━━━━━━━━╯
+
+📋 *Group Description:*
+${groupDesc}
+
+We are glad to have you here! 🥳
+Please read the group rules and enjoy your stay.
+
+*Made by Kimani Samuel*`;
+
+    try {
+      if (ppBuffer) {
+        await sock.sendMessage(groupId, { image: ppBuffer, caption: welcomeMsg, mentions: [jidStr] });
+      } else {
+        await sock.sendMessage(groupId, { text: welcomeMsg, mentions: [jidStr] });
+      }
+    } catch (err) {
+      console.warn('Welcome send error:', err.message);
+    }
+  }
+}
+
+// ─── GOODBYE ─────────────────────────────────────────────────────────────────
+async function handleGroupGoodbye(sock, groupId, participants) {
+  let meta;
+  try { meta = await sock.groupMetadata(groupId); } catch { return; }
+  const groupName = meta.subject;
+
+  for (const participant of participants) {
+    const jidStr = typeof participant === 'string' ? participant : (participant.id || participant.toString());
+    const number = `+${normalizeNumber(jidStr)}`;
+    const pushName = (typeof participant === 'object' && participant.pushName) || number;
+
+    let ppBuffer = null;
+    try {
+      const ppUrl = await sock.profilePictureUrl(jidStr, 'image');
+      if (ppUrl) {
+        const { data } = await axios.get(ppUrl, { responseType: 'arraybuffer', timeout: 10000 });
+        ppBuffer = Buffer.from(data);
+      }
+    } catch {}
+
+    const goodbyeMsg = `╭╼━≪• 👋 *GOODBYE* •≫━╾╮
+┃ 😢 *${pushName}* has left
+┃ 📞 Number: ${number}
+┃ 🏡 Group: *${groupName}*
+╰━━━━━━━━━━━━━━━━╯
+
+💔 We will miss you! 
+Goodbye and take care! 👋
+
+*Made by Kimani Samuel*`;
+
+    try {
+      if (ppBuffer) {
+        await sock.sendMessage(groupId, { image: ppBuffer, caption: goodbyeMsg, mentions: [jidStr] });
+      } else {
+        await sock.sendMessage(groupId, { text: goodbyeMsg, mentions: [jidStr] });
+      }
+    } catch (err) {
+      console.warn('Goodbye send error:', err.message);
+    }
+  }
+}
+
 async function handleMessage(sock, rawMessage) {
   const message = unwrapMessage(rawMessage);
   if (!message?.message || message.key?.remoteJid === 'status@broadcast') return;
@@ -264,6 +684,13 @@ async function handleMessage(sock, rawMessage) {
   const state = getState();
   if (!fromMe) await sendAutoPresence(sock, chatId, state);
   schedulePrivateGreet(sock, message, chatId, sender, fromMe);
+
+  // ─── Run anti-moderation on all group messages (even non-command) ─────────
+  if (isGroup && !fromMe) {
+    if (rawText) await handleLinkDetection(sock, message, chatId, sender, rawText, state);
+    await handleTagDetection(sock, message, chatId, sender, state);
+  }
+
   if (!rawText) return;
 
   const cfg = getConfig();
@@ -286,8 +713,6 @@ async function handleMessage(sock, rawMessage) {
   let cmdName = cmdNameRaw.toLowerCase();
   let command = registry.get(cmdName);
 
-  // Support compact owner command syntax such as .setprefix+
-  // After it is saved, the next commands must use the new prefix, for example +menu.
   if (!command) {
     const compactPrefixChange = body.match(/^(setprefix|prefixset|newprefix)(.+)$/i);
     if (compactPrefixChange) {
@@ -322,7 +747,8 @@ async function handleMessage(sock, rawMessage) {
   const ctx = {
     sock, message, chatId, sender, isGroup, args,
     rawText, body, commandName: cmdName, prefix, pushName: message.pushName || '',
-    owner, mentions: mentionedJids(message)
+    owner, mentions: mentionedJids(message),
+    messageStore  // expose store to commands like del
   };
   try {
     await reactToCommand(sock, message, cmdName);
@@ -331,165 +757,6 @@ async function handleMessage(sock, rawMessage) {
     await sock.sendPresenceUpdate('paused', chatId).catch(() => {});
   } catch (err) {
     await sendError(sock, chatId, message, err);
-  }
-}
-
-// ─── VV2: Auto-forward view-once to owner's saved messages ─────────────────
-async function handleViewOnceAutoForward(sock, rawMessage) {
-  try {
-    const st = getState();
-    if (st.groupSettings?._vv2 === false) return; // off if explicitly disabled
-    const message = unwrapMessage(rawMessage);
-    if (!message?.message) return;
-    const chatId = message.key.remoteJid;
-    const fromMe = Boolean(message.key.fromMe);
-    if (fromMe) return; // don't process own messages
-    const sender = message.key.participant || message.key.remoteJid;
-    const msg = message.message;
-    const viewOnceMsg = msg.viewOnceMessage?.message || msg.viewOnceMessageV2?.message || msg.viewOnceMessageV2Extension?.message;
-    if (!viewOnceMsg) return;
-    const imgMsg = viewOnceMsg.imageMessage;
-    const vidMsg = viewOnceMsg.videoMessage;
-    if (!imgMsg && !vidMsg) return;
-
-    const { downloadContentFromMessage } = await import('@whiskeysockets/baileys');
-    const cfg = getConfig();
-    const ownerJid = `${normalizeNumber(cfg.ownerNumber || OWNER_NUMBER)}@s.whatsapp.net`;
-    const selfJid = sock.user?.id || sock.user?.jid || ownerJid;
-
-    // Build info text
-    const senderNumber = `+${normalizeNumber(sender)}`;
-    const senderName = message.pushName || senderNumber;
-    const isGroup = chatId.endsWith('@g.us');
-    let source = 'Private DM';
-    if (isGroup) {
-      try {
-        const meta = await sock.groupMetadata(chatId);
-        source = `Group: ${meta.subject}`;
-      } catch { source = `Group: ${chatId}`; }
-    }
-    const now = new Date();
-    const dateStr = now.toLocaleDateString('en-GB', { timeZone: cfg.timeZone || 'Africa/Nairobi', day: '2-digit', month: 'short', year: 'numeric' });
-    const timeStr = now.toLocaleTimeString('en-GB', { timeZone: cfg.timeZone || 'Africa/Nairobi', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
-    const caption = `📸 *View-Once Received*\n\n👤 *Sender:* ${senderName}\n📞 *Number:* ${senderNumber}\n📍 *From:* ${source}\n📅 *Date:* ${dateStr}\n⏰ *Time:* ${timeStr}`;
-
-    if (imgMsg) {
-      const stream = await downloadContentFromMessage(imgMsg, 'image');
-      let buf = Buffer.from([]);
-      for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
-      await sock.sendMessage(selfJid, { image: buf, caption });
-    } else if (vidMsg) {
-      const stream = await downloadContentFromMessage(vidMsg, 'video');
-      let buf = Buffer.from([]);
-      for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
-      await sock.sendMessage(selfJid, { video: buf, caption });
-    }
-  } catch (err) {
-    // Silent fail — vv2 should never surface errors
-  }
-}
-
-// ─── WELCOME: Send welcome message with DP ─────────────────────────────────
-async function handleGroupWelcome(sock, groupId, participants) {
-  const cfg = getConfig();
-  let meta;
-  try { meta = await sock.groupMetadata(groupId); } catch { return; }
-  const groupName = meta.subject;
-  const groupDesc = meta.desc || 'No description available.';
-  const memberCount = meta.participants?.length || 0;
-
-  for (const participant of participants) {
-    const jidStr = typeof participant === 'string' ? participant : (participant.id || participant.toString());
-    const number = `+${normalizeNumber(jidStr)}`;
-    const pushName = (typeof participant === 'object' && participant.pushName) || number;
-
-    // Fetch DP
-    let ppBuffer = null;
-    try {
-      const ppUrl = await sock.profilePictureUrl(jidStr, 'image');
-      if (ppUrl) {
-        const { data } = await axios.get(ppUrl, { responseType: 'arraybuffer', timeout: 10000 });
-        ppBuffer = Buffer.from(data);
-      }
-    } catch { /* default: no image */ }
-
-    const welcomeMsg = `╭╼━≪• 🎉 *WELCOME* •≫━╾╮
-┃ 👋 Hello *${pushName}*!
-┃ 📞 Number: ${number}
-┃ 🏡 Group: *${groupName}*
-┃ 👥 Members: *${memberCount}*
-╰━━━━━━━━━━━━━━━━╯
-
-📋 *Group Description:*
-${groupDesc}
-
-We are glad to have you here! 🥳
-Please read the group rules and enjoy your stay.
-
-*Made by Kimani Samuel*`;
-
-    try {
-      if (ppBuffer) {
-        await sock.sendMessage(groupId, {
-          image: ppBuffer,
-          caption: welcomeMsg,
-          mentions: [jidStr]
-        });
-      } else {
-        await sock.sendMessage(groupId, { text: welcomeMsg, mentions: [jidStr] });
-      }
-    } catch (err) {
-      console.warn('Welcome send error:', err.message);
-    }
-  }
-}
-
-// ─── GOODBYE: Send goodbye message with DP ──────────────────────────────────
-async function handleGroupGoodbye(sock, groupId, participants) {
-  let meta;
-  try { meta = await sock.groupMetadata(groupId); } catch { return; }
-  const groupName = meta.subject;
-
-  for (const participant of participants) {
-    const jidStr = typeof participant === 'string' ? participant : (participant.id || participant.toString());
-    const number = `+${normalizeNumber(jidStr)}`;
-    const pushName = (typeof participant === 'object' && participant.pushName) || number;
-
-    // Fetch DP
-    let ppBuffer = null;
-    try {
-      const ppUrl = await sock.profilePictureUrl(jidStr, 'image');
-      if (ppUrl) {
-        const { data } = await axios.get(ppUrl, { responseType: 'arraybuffer', timeout: 10000 });
-        ppBuffer = Buffer.from(data);
-      }
-    } catch { /* default: no image */ }
-
-    const goodbyeMsg = `╭╼━≪• 👋 *GOODBYE* •≫━╾╮
-┃ 😢 *${pushName}* has left
-┃ 📞 Number: ${number}
-┃ 🏡 Group: *${groupName}*
-╰━━━━━━━━━━━━━━━━╯
-
-💔 We will miss you! 
-Goodbye and take care! 👋
-
-*Made by Kimani Samuel*`;
-
-    try {
-      if (ppBuffer) {
-        await sock.sendMessage(groupId, {
-          image: ppBuffer,
-          caption: goodbyeMsg,
-          mentions: [jidStr]
-        });
-      } else {
-        await sock.sendMessage(groupId, { text: goodbyeMsg, mentions: [jidStr] });
-      }
-    } catch (err) {
-      console.warn('Goodbye send error:', err.message);
-    }
   }
 }
 
@@ -556,13 +823,29 @@ async function startBot() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
+      const st = getState();
+      // ── Status handling ────────────────────────────────────────────────────
       await handleStatusMessage(sock, msg);
+      await handleAntideleteStatus(sock, msg, st);
+
+      // ── Antidelete: detect protocol revocation messages ────────────────────
+      if (msg.message?.protocolMessage?.type === 0) {
+        await handleAntidelete(sock, msg, st);
+        continue; // don't process revocation as a normal message
+      }
+
+      // ── Store message for antidelete BEFORE processing ────────────────────
+      await storeMessageForAntidelete(sock, msg, st);
+
+      // ── View-once auto-forward ─────────────────────────────────────────────
       await handleViewOnceAutoForward(sock, msg);
+
+      // ── Normal message handling ────────────────────────────────────────────
       await handleMessage(sock, msg);
     }
   });
 
-  // ─── GROUP EVENTS: Welcome & Goodbye ─────────────────────────────────────
+  // ─── GROUP EVENTS ─────────────────────────────────────────────────────────
   sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
     try {
       const st = getState();
