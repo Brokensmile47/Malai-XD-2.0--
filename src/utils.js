@@ -123,12 +123,23 @@ export function randomChoice(arr) { return arr[Math.floor(Math.random() * arr.le
 export async function isAdmin(sock, chatId, jid) {
   try {
     const meta = await sock.groupMetadata(chatId);
-    const p = meta.participants.find(x => x.id === jid || x.jid === jid);
+    // Strip "@domain" and ":device" suffix
+    const strip = (s = '') => String(s).split('@')[0].split(':')[0];
+    const target = strip(jid);
+    const p = meta.participants.find(x =>
+      (x.id || x.jid) === jid ||
+      (x.lid || '')   === jid ||
+      strip(x.id || x.jid || '') === target ||
+      strip(x.lid || '')         === target
+    );
     return Boolean(p?.admin || p?.isAdmin);
   } catch { return false; }
 }
 
 export async function groupAdmins(sock, chatId) {
   const meta = await sock.groupMetadata(chatId);
-  return meta.participants.filter(p => p.admin || p.isAdmin).map(p => p.id || p.jid);
+  return meta.participants
+    .filter(p => p.admin || p.isAdmin)
+    .map(p => p.id || p.jid || p.lid)
+    .filter(Boolean);
 }
