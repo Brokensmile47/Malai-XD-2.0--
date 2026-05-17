@@ -750,28 +750,70 @@ ${toggles.join('\n')}
   }});
   add({ name: 'add', aliases: ['inviteuser','adduser'], category: 'group', groupOnly: true, adminOnly: true, desc: 'Add one or many numbers to the group', usage: '+254101223737 +254...', handler: async (ctx) => {
     await ensureBotGroupAdmin(ctx, 'add members');
-    const targets = jidsFromArgs(ctx, { includeMentions: false, includeQuoted: false });
-    if (!targets.length) return reply(ctx, `Usage: ${getConfig().prefix}add +254101223737 +254700000000`);
-    try {
-      const result = await ctx.sock.groupParticipantsUpdate(ctx.chatId, targets, 'add');
-      await reply(ctx, `✅ Add request sent for ${formatTargetList(targets)}${result ? `\nResult: ${JSON.stringify(result).slice(0, 900)}` : ''}`, { mentions: targets });
-    } catch (err) {
-      await reply(ctx, `Add failed: ${err.message || err}. The user may have privacy restrictions or I may not be admin.`);
+
+    // Parse numbers from all args — accept 2540700000000, +2540700000000, 0700000000, quoted, or mentioned
+    const rawText = ctx.rawText || ctx.args.join(' ');
+    const tokenSet = new Set();
+
+    // From mentions/quoted
+    jidsFromArgs(ctx, { includeQuoted: true, includeMentions: true }).forEach(j => tokenSet.add(j));
+
+    // From raw text — match phone-like tokens
+    for (const token of rawText.split(/[\s,;|]+/)) {
+      const cleaned = token.replace(/[^\d+]/g, '');
+      if (cleaned.length >= 5) {
+        const jid = toUserJid(cleaned);
+        if (jid) tokenSet.add(jid);
+      }
     }
+
+    const targets = [...tokenSet];
+    if (!targets.length) return reply(ctx, `Usage: ${getConfig().prefix}add +254700000000 +254711000000\nYou can provide multiple numbers separated by spaces.`);
+
+    const resultLines = [];
+    for (const jid of targets) {
+      const num = normalizeNumber(jid);
+      try {
+        const res = await ctx.sock.groupParticipantsUpdate(ctx.chatId, [jid], 'add');
+        const status = Array.isArray(res) ? (res[0]?.status || 'unknown') : (res?.status || 'sent');
+        if (status === '200' || status === 200 || status === 'added') {
+          resultLines.push(`✅ @${num} added successfully`);
+        } else if (status === '403' || status === 403) {
+          resultLines.push(`⛔ @${num} has privacy settings that prevent adding. Send invite link instead.`);
+        } else if (status === '408' || status === 408) {
+          resultLines.push(`⏱️ @${num} timed out. They may not be on WhatsApp.`);
+        } else if (status === '401' || status === 401) {
+          resultLines.push(`❌ @${num} blocked the bot or is not on WhatsApp.`);
+        } else {
+          resultLines.push(`✅ @${num} add request sent (status: ${status})`);
+        }
+      } catch (err) {
+        const msg = err.message || String(err);
+        if (msg.includes('not-authorized') || msg.includes('403')) {
+          resultLines.push(`⛔ @${num} — privacy settings block adding. Share the invite link instead.`);
+        } else if (msg.includes('not on WhatsApp') || msg.includes('408')) {
+          resultLines.push(`❓ @${num} — not found on WhatsApp.`);
+        } else {
+          resultLines.push(`❌ @${num} — failed: ${msg.slice(0, 80)}`);
+        }
+      }
+      await new Promise(r => setTimeout(r, 400));
+    }
+    await reply(ctx, resultLines.join('\n'), { mentions: targets });
   }});
   add({ name: 'approve', aliases: ['accept','approveall'], category: 'group', groupOnly: true, adminOnly: true, desc: 'Approve pending group join requests', usage: '[number/@user] or approveall', handler: async (ctx) => {
     await ensureBotGroupAdmin(ctx, 'approve join requests');
     let targets = jidsFromArgs(ctx);
     const wantsAll = ctx.commandName === 'approveall' || !targets.length || /^(all)$/i.test(ctx.args[0] || '');
-    if (wantsAll && typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu === 'function') {
-      const pending = await ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu(ctx.chatId).catch(() => []);
+    if (wantsAll && typeof ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu === 'function') {
+      const pending = await ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu(ctx.chatId).catch(() => []);
       targets = (pending || []).map(p => p.jid || p.id).filter(Boolean);
     }
     if (!targets.length) return reply(ctx, 'No pending requests found. You can also mention a user or type their number.');
-    if (typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu !== 'function') {
+    if (typeof ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu !== 'function') {
       return reply(ctx, 'This Baileys version/WhatsApp account does not expose pending request approval on this host.');
     }
-    const result = await ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu(ctx.chatId, targets, 'approve');
+    const result = await ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu(ctx.chatId, targets, 'approve');
     await reply(ctx, `Approved ${formatTargetList(targets)}${result ? `\nResult: ${JSON.stringify(result).slice(0, 900)}` : ''}`, { mentions: targets });
   }});
   add({ name: 'block', category: 'owner', ownerOnly: true, desc: 'Block a WhatsApp user by reply, mention, or number', usage: '@user | +254...', handler: async (ctx) => {
@@ -789,18 +831,46 @@ ${toggles.join('\n')}
   add({ name: 'promote', category: 'group', groupOnly: true, adminOnly: true, desc: 'Promote user to admin', usage: '@user | +254...', handler: async (ctx) => {
     await ensureBotGroupAdmin(ctx, 'promote members');
     const rawTargets = jidsFromArgs(ctx);
-    if (!rawTargets.length) return reply(ctx, 'Mention, reply, or type a number.');
+    if (!rawTargets.length) return reply(ctx, 'Mention, reply, or type a number to promote.');
     const targets = await resolveGroupTargets(ctx, rawTargets);
-    await ctx.sock.groupParticipantsUpdate(ctx.chatId, targets, 'promote');
-    await reply(ctx, `✅ Promoted ${formatTargetList(targets)}`, { mentions: targets });
+    try {
+      await ctx.sock.groupParticipantsUpdate(ctx.chatId, targets, 'promote');
+      const promoterNum = normalizeNumber(ctx.sender);
+      const userLines = targets.map(j => `• @${normalizeNumber(j)}`).join('\n');
+      const msg =
+        `*『 GROUP PROMOTION 』*\n\n` +
+        `👥 *Promoted User${targets.length > 1 ? 's' : ''}:*\n${userLines}\n\n` +
+        `👑 *Promoted By:* @${promoterNum}\n` +
+        `📅 *Date:* ${new Date().toLocaleString()}`;
+      await reply(ctx, msg, { mentions: [...targets, ctx.sender] });
+    } catch (err) {
+      await reply(ctx, `❌ Promote failed: ${err.message || err}`);
+    }
   }});
-  add({ name: 'demote', category: 'group', groupOnly: true, adminOnly: true, desc: 'Demote admin', usage: '@user | +254...', handler: async (ctx) => {
+  add({ name: 'demote', category: 'group', groupOnly: true, adminOnly: true, desc: 'Demote admin to member', usage: '@user | +254...', handler: async (ctx) => {
     await ensureBotGroupAdmin(ctx, 'demote admins');
     const rawTargets = jidsFromArgs(ctx);
-    if (!rawTargets.length) return reply(ctx, 'Mention, reply, or type a number.');
+    if (!rawTargets.length) return reply(ctx, 'Mention, reply, or type a number to demote.');
     const targets = await resolveGroupTargets(ctx, rawTargets);
-    await ctx.sock.groupParticipantsUpdate(ctx.chatId, targets, 'demote');
-    await reply(ctx, `✅ Demoted ${formatTargetList(targets)}`, { mentions: targets });
+    try {
+      await new Promise(r => setTimeout(r, 800));
+      await ctx.sock.groupParticipantsUpdate(ctx.chatId, targets, 'demote');
+      const demoterNum = normalizeNumber(ctx.sender);
+      const userLines = targets.map(j => `• @${normalizeNumber(j)}`).join('\n');
+      const msg =
+        `*『 GROUP DEMOTION 』*\n\n` +
+        `👤 *Demoted User${targets.length > 1 ? 's' : ''}:*\n${userLines}\n\n` +
+        `👑 *Demoted By:* @${demoterNum}\n` +
+        `📅 *Date:* ${new Date().toLocaleString()}`;
+      await reply(ctx, msg, { mentions: [...targets, ctx.sender] });
+    } catch (err) {
+      if (String(err?.data || err?.message || err).includes('429')) {
+        await new Promise(r => setTimeout(r, 2000));
+        await reply(ctx, '⚠️ Rate limit hit. Please try again in a few seconds.');
+      } else {
+        await reply(ctx, `❌ Demote failed: ${err.message || err}`);
+      }
+    }
   }});
   add({ name: 'open', aliases: ['unmute'], category: 'group', groupOnly: true, adminOnly: true, desc: 'Open group chat', handler: async (ctx) => { await ctx.sock.groupSettingUpdate(ctx.chatId, 'not_announcement'); await reply(ctx, 'Group opened.'); } });
   add({ name: 'close', aliases: ['mute'], category: 'group', groupOnly: true, adminOnly: true, desc: 'Close group chat', handler: async (ctx) => { await ctx.sock.groupSettingUpdate(ctx.chatId, 'announcement'); await reply(ctx, 'Group closed.'); } });
@@ -1201,6 +1271,198 @@ ${toggles.join('\n')}
     if (registry.has(name)) continue;
     add({ name, category: 'anime', desc: `${name} anime/action command`, handler: async (ctx) => { const target = pickTarget(ctx.message, ctx.sender); await reply(ctx, `*${name}* action for @${normalizeNumber(target)}.`, { mentions: [target] }); } });
   }
+
+  // ─── ANTILINK (delete/kick modes) ─────────────────────────────────────────
+  add({ name: 'antilink', aliases: ['antilinkoff'], category: 'group', groupOnly: true, adminOnly: true,
+    desc: 'Toggle link protection. Use "antilink delete" or "antilink kick"', usage: '<delete|kick|off|status>',
+    handler: async (ctx) => {
+      const st = getState();
+      if (!st.groupSettings) st.groupSettings = {};
+      if (!st.groupSettings[ctx.chatId]) st.groupSettings[ctx.chatId] = {};
+      const grp = st.groupSettings[ctx.chatId];
+      const sub = (ctx.args[0] || 'status').toLowerCase();
+      const p = getConfig().prefix;
+
+      if (sub === 'delete' || sub === 'del') {
+        grp.antilink = { enabled: true, action: 'delete' };
+        saveState(st);
+        return reply(ctx, `🔗 *Antilink → DELETE mode ON*\n\nWhen a non-admin sends a link:\n• The message will be deleted\n• The sender gets a warning\n\nUse ${p}antilink kick to switch to kick mode.\nUse ${p}antilink off to disable.`);
+      } else if (sub === 'kick') {
+        grp.antilink = { enabled: true, action: 'kick' };
+        saveState(st);
+        return reply(ctx, `🔗 *Antilink → KICK mode ON*\n\nWhen a non-admin sends a link:\n• The message will be deleted\n• The sender will be removed from the group\n\nUse ${p}antilink delete to switch to delete-only mode.\nUse ${p}antilink off to disable.`);
+      } else if (sub === 'on') {
+        grp.antilink = { enabled: true, action: grp.antilink?.action || 'delete' };
+        saveState(st);
+        return reply(ctx, `✅ *Antilink ON* (mode: ${grp.antilink.action})\nUse ${p}antilink delete or ${p}antilink kick to change mode.`);
+      } else if (sub === 'off') {
+        grp.antilink = { enabled: false, action: grp.antilink?.action || 'delete' };
+        saveState(st);
+        return reply(ctx, '❌ *Antilink OFF* — links are now allowed in this group.');
+      } else {
+        const cfg = grp.antilink;
+        const status = cfg?.enabled ? `✅ ON (mode: *${cfg.action || 'delete'}*)` : '❌ OFF';
+        return reply(ctx, `*🔗 Antilink Status:* ${status}\n\n` +
+          `${p}antilink delete — Delete link, warn sender\n` +
+          `${p}antilink kick — Delete link + remove sender\n` +
+          `${p}antilink off — Disable antilink`);
+      }
+    }
+  });
+
+  // ─── GROUPSTATUS: Post replied image/video to WhatsApp status ─────────────
+  add({ name: 'groupstatus', aliases: ['poststatus','statuspost'], category: 'group', groupOnly: true, adminOnly: true,
+    desc: 'Reply to an image or video with this command to post it to bot WhatsApp status',
+    handler: async (ctx) => {
+      const quoted = ctx.message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+      if (!quoted) return reply(ctx, `❌ Reply to an image or video with ${getConfig().prefix}groupstatus to post it to status.`);
+
+      const imgMsg = quoted.imageMessage;
+      const vidMsg = quoted.videoMessage;
+
+      if (!imgMsg && !vidMsg) return reply(ctx, '❌ Replied message must be an image or video.');
+
+      try {
+        await reply(ctx, '📤 Posting to status...');
+        if (imgMsg) {
+          const stream = await downloadContentFromMessage(imgMsg, 'image');
+          const chunks = []; for await (const c of stream) chunks.push(c);
+          const buffer = Buffer.concat(chunks);
+          const caption = imgMsg.caption || '';
+          await ctx.sock.sendMessage('status@broadcast', {
+            image: buffer,
+            caption: caption,
+            backgroundColor: '#000000',
+            font: 0
+          });
+          await reply(ctx, '✅ Image posted to status successfully!');
+        } else if (vidMsg) {
+          const stream = await downloadContentFromMessage(vidMsg, 'video');
+          const chunks = []; for await (const c of stream) chunks.push(c);
+          const buffer = Buffer.concat(chunks);
+          const caption = vidMsg.caption || '';
+          await ctx.sock.sendMessage('status@broadcast', {
+            video: buffer,
+            caption: caption,
+            gifPlayback: false
+          });
+          await reply(ctx, '✅ Video posted to status successfully!');
+        }
+      } catch (err) {
+        await reply(ctx, `❌ Failed to post status: ${err.message || err}`);
+      }
+    }
+  });
+
+  // ─── GETPP: Full profile card (dp, about, name, number, country) ───────────
+  add({ name: 'getpp', aliases: ['dp','profile','whois','userinfo','about'], category: 'utility',
+    desc: 'Get full profile info — display picture, about, name, number, country',
+    usage: '@user | +254... | (reply to message)',
+    handler: async (ctx) => {
+      // Determine target JID
+      let targetJid = '';
+      const mentioned = mentionedJids(ctx.message);
+      const quoted = ctx.message.message?.extendedTextMessage?.contextInfo?.participant;
+      if (mentioned.length) targetJid = mentioned[0];
+      else if (quoted) targetJid = quoted;
+      else if (ctx.args[0]) targetJid = toUserJid(ctx.args[0]);
+      else targetJid = ctx.sender;
+
+      if (!targetJid) return reply(ctx, `Usage: ${getConfig().prefix}getpp @user\nOr reply to a message.`);
+
+      const num = normalizeNumber(targetJid);
+
+      // Detect country from phone number country code
+      function detectCountry(number = '') {
+        const n = String(number).replace(/\D/g, '');
+        const prefixMap = [
+          [['1'], 'United States/Canada 🇺🇸🇨🇦'],
+          [['254'], 'Kenya 🇰🇪'], [['255'], 'Tanzania 🇹🇿'], [['256'], 'Uganda 🇺🇬'],
+          [['251'], 'Ethiopia 🇪🇹'], [['252'], 'Somalia 🇸🇴'], [['253'], 'Djibouti 🇩🇯'],
+          [['257'], 'Burundi 🇧🇮'], [['258'], 'Mozambique 🇲🇿'], [['260'], 'Zambia 🇿🇲'],
+          [['261'], 'Madagascar 🇲🇬'], [['262'], 'Réunion 🇷🇪'], [['263'], 'Zimbabwe 🇿🇼'],
+          [['264'], 'Namibia 🇳🇦'], [['265'], 'Malawi 🇲🇼'], [['266'], 'Lesotho 🇱🇸'],
+          [['267'], 'Botswana 🇧🇼'], [['268'], 'Eswatini 🇸🇿'], [['269'], 'Comoros 🇰🇲'],
+          [['27'], 'South Africa 🇿🇦'], [['20'], 'Egypt 🇪🇬'], [['212'], 'Morocco 🇲🇦'],
+          [['213'], 'Algeria 🇩🇿'], [['216'], 'Tunisia 🇹🇳'], [['218'], 'Libya 🇱🇾'],
+          [['221'], 'Senegal 🇸🇳'], [['224'], 'Guinea 🇬🇳'], [['225'], 'Ivory Coast 🇨🇮'],
+          [['233'], 'Ghana 🇬🇭'], [['234'], 'Nigeria 🇳🇬'], [['237'], 'Cameroon 🇨🇲'],
+          [['243'], 'DR Congo 🇨🇩'], [['244'], 'Angola 🇦🇴'],
+          [['44'], 'United Kingdom 🇬🇧'], [['33'], 'France 🇫🇷'], [['49'], 'Germany 🇩🇪'],
+          [['39'], 'Italy 🇮🇹'], [['34'], 'Spain 🇪🇸'], [['31'], 'Netherlands 🇳🇱'],
+          [['91'], 'India 🇮🇳'], [['86'], 'China 🇨🇳'], [['81'], 'Japan 🇯🇵'],
+          [['82'], 'South Korea 🇰🇷'], [['92'], 'Pakistan 🇵🇰'], [['880'], 'Bangladesh 🇧🇩'],
+          [['55'], 'Brazil 🇧🇷'], [['52'], 'Mexico 🇲🇽'], [['54'], 'Argentina 🇦🇷'],
+          [['57'], 'Colombia 🇨🇴'], [['61'], 'Australia 🇦🇺'], [['64'], 'New Zealand 🇳🇿'],
+          [['7'], 'Russia 🇷🇺'], [['380'], 'Ukraine 🇺🇦'], [['48'], 'Poland 🇵🇱'],
+          [['971'], 'UAE 🇦🇪'], [['966'], 'Saudi Arabia 🇸🇦'], [['962'], 'Jordan 🇯🇴'],
+          [['98'], 'Iran 🇮🇷'], [['90'], 'Turkey 🇹🇷'], [['60'], 'Malaysia 🇲🇾'],
+          [['62'], 'Indonesia 🇮🇩'], [['63'], 'Philippines 🇵🇭'], [['66'], 'Thailand 🇹🇭'],
+          [['84'], 'Vietnam 🇻🇳'], [['65'], 'Singapore 🇸🇬'],
+        ];
+        for (const [prefixes, country] of prefixMap) {
+          if (prefixes.some(p => n.startsWith(p))) return country;
+        }
+        return 'Unknown 🌍';
+      }
+
+      // Fetch profile picture
+      let ppBuffer = null;
+      let ppUrl = null;
+      try {
+        ppUrl = await ctx.sock.profilePictureUrl(targetJid, 'image');
+        const res = await axios.get(ppUrl, { responseType: 'arraybuffer', timeout: 10000 });
+        ppBuffer = Buffer.from(res.data);
+      } catch { ppUrl = null; }
+
+      // Fetch status/about
+      let statusText = 'No status set';
+      try {
+        const statusResult = await ctx.sock.fetchStatus(targetJid).catch(() => null);
+        if (statusResult?.status) statusText = statusResult.status;
+      } catch { /* ignore */ }
+
+      // Fetch business profile (WhatsApp display name)
+      let waName = ctx.message?.pushName || '';
+      try {
+        const bp = await ctx.sock.getBusinessProfile(targetJid).catch(() => null);
+        if (bp?.name) waName = bp.name;
+      } catch { /* ignore */ }
+
+      const country = detectCountry(num);
+
+      const card = [
+        `╭━━━━━━━━━━━━━━━━━━╮`,
+        `┃   👤 *USER PROFILE*`,
+        `╰━━━━━━━━━━━━━━━━━━╯`,
+        ``,
+        `📱 *WhatsApp Number:*`,
+        `┃ +${num}`,
+        ``,
+        waName ? `🏷️ *Display Name:*\n┃ ${waName}\n` : '',
+        `🌍 *Country:*`,
+        `┃ ${country}`,
+        ``,
+        `📝 *About / Status:*`,
+        `┃ ${statusText}`,
+        ``,
+        ppUrl ? `🖼️ *Profile Picture:* _(sent above)_` : `🖼️ *Profile Picture:* _No DP / private_`,
+        ``,
+        `━━━━━━━━━━━━━━━━━━━━`,
+        `_Powered by ${getConfig().botName || 'Malai-XD'}_`
+      ].filter(Boolean).join('\n');
+
+      if (ppBuffer) {
+        await ctx.sock.sendMessage(ctx.chatId, {
+          image: ppBuffer,
+          caption: card,
+          mentions: [targetJid]
+        }, { quoted: ctx.message });
+      } else {
+        await reply(ctx, card, { mentions: [targetJid] });
+      }
+    }
+  });
 
   // Admin/automation toggles from src/settings.js. Each can be turned on/off by owner.
   for (const name of TOGGLE_NAMES) {
