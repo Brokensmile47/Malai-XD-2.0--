@@ -635,7 +635,7 @@ ${toggles.join('\n')}
   }});
   add({ name: 'password', aliases: ['passgen'], category: 'utility', desc: 'Generate password', handler: async (ctx) => {
     const len = Math.min(Math.max(Number(ctx.args[0] || 16), 6), 64);
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%';
+    const chars = 'ABCDEFGHJKLMN8SjFSqSJ6DYAcBJrNGN76hEhcij5vtyJK5G819CvV7Fm!@#$%';
     let out = ''; for (let i=0;i<len;i++) out += chars[Math.floor(Math.random()*chars.length)];
     await reply(ctx, out);
   }});
@@ -736,15 +736,15 @@ ${toggles.join('\n')}
     await ensureBotGroupAdmin(ctx, 'approve join requests');
     let targets = jidsFromArgs(ctx);
     const wantsAll = ctx.commandName === 'approveall' || !targets.length || /^(all)$/i.test(ctx.args[0] || '');
-    if (wantsAll && typeof ctx.sock.groupRequestParticipantsList === 'function') {
-      const pending = await ctx.sock.groupRequestParticipantsList(ctx.chatId).catch(() => []);
+    if (wantsAll && typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu === 'function') {
+      const pending = await ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu(ctx.chatId).catch(() => []);
       targets = (pending || []).map(p => p.jid || p.id).filter(Boolean);
     }
     if (!targets.length) return reply(ctx, 'No pending requests found. You can also mention a user or type their number.');
-    if (typeof ctx.sock.groupRequestParticipantsUpdate !== 'function') {
+    if (typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu !== 'function') {
       return reply(ctx, 'This Baileys version/WhatsApp account does not expose pending request approval on this host.');
     }
-    const result = await ctx.sock.groupRequestParticipantsUpdate(ctx.chatId, targets, 'approve');
+    const result = await ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu(ctx.chatId, targets, 'approve');
     await reply(ctx, `Approved ${formatTargetList(targets)}${result ? `\nResult: ${JSON.stringify(result).slice(0, 900)}` : ''}`, { mentions: targets });
   }});
   add({ name: 'block', category: 'owner', ownerOnly: true, desc: 'Block a WhatsApp user by reply, mention, or number', usage: '@user | +254...', handler: async (ctx) => {
@@ -912,52 +912,132 @@ ${toggles.join('\n')}
   }
 
   // ─── PLAY: Knightbot-MD style with keith API fallback ─────────────────────
+  // ─── PLAY / SONG: Download YouTube audio (multi-API with fallback) ─────────
   add({ name: 'play', aliases: ['song', 'song2', 'music', 'ytmp3'], category: 'downloads', desc: 'Download YouTube audio', usage: '<song name or URL>', handler: async (ctx) => {
     const cfg = getConfig();
     const query = textArg(ctx.args);
     if (!query) return reply(ctx, `What song do you want to download?\nUsage: ${cfg.prefix}play <song name>`);
     await reply(ctx, `🎵 _Searching for_ *${query}*...\n_Please wait, download in progress_ ⏳`);
     try {
-      // Try yt-search first
-      const yts = (await import('yt-search').catch(() => null))?.default;
+      // 1. Resolve YouTube URL from search query
       let youtubeUrl = '';
-      let title = query;
-      if (yts) {
-        const result = await yts(query);
-        const video = result?.videos?.[0];
-        if (video?.url) { youtubeUrl = video.url; title = video.title || query; }
+      let videoTitle = query;
+      let videoThumb = '';
+      let videoDuration = '';
+
+      if (/^https?:\/\//i.test(query) && /youtube\.com|youtu\.be/i.test(query)) {
+        youtubeUrl = query;
+      } else {
+        try {
+          const yts = (await import('yt-search').catch(() => null))?.default;
+          if (yts) {
+            const result = await yts(query);
+            const video = result?.videos?.[0];
+            if (video?.url) {
+              youtubeUrl = video.url;
+              videoTitle = video.title || query;
+              videoThumb = video.thumbnail || '';
+              videoDuration = video.timestamp || '';
+            }
+          }
+        } catch {}
       }
-      if (!youtubeUrl && /^https?:\/\//i.test(query)) youtubeUrl = query;
-      if (!youtubeUrl) throw new Error('Could not find that song on YouTube.');
-      // Try Knightbot-MD API first, then fallback
+      if (!youtubeUrl) throw new Error('Could not find that song on YouTube. Try a direct YouTube link.');
+
+      // Send thumbnail while downloading
+      if (videoThumb) {
+        try {
+          await ctx.sock.sendMessage(ctx.chatId, {
+            image: { url: videoThumb },
+            caption: `🎵 Downloading: *${videoTitle}*${videoDuration ? '\n⏱ Duration: ' + videoDuration : ''}`
+          }, { quoted: ctx.message });
+        } catch {}
+      }
+
+      // 2. Try multiple download APIs
       const encoded = encodeURIComponent(youtubeUrl);
       const apis = [
         `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}`,
+        `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3`,
+        `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}`,
         `https://api.davidcyriltech.my.id/download/ytmp3?url=${encoded}`,
         `https://api.dreaded.site/api/ytdl/audio?url=${encoded}`,
-        `https://bk9.fun/download/ytmp3?url=${encoded}`
+        `https://bk9.fun/download/ytmp3?url=${encoded}`,
+        `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}`
       ];
+
+      const HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, */*'
+      };
+
       let audioUrl = '';
-      let finalTitle = title;
+      let finalTitle = videoTitle;
+
       for (const api of apis) {
         try {
-          const { data } = await axios.get(api, { timeout: 45000 });
+          const { data } = await axios.get(api, { timeout: 30000, headers: HEADERS });
           const flat = JSON.stringify(data);
-          const match = flat.match(/https?:\/\/[^\s"']+\.(mp3|ogg|m4a)[^\s"']*/i);
-          if (match) { audioUrl = match[0]; finalTitle = data?.result?.title || data?.data?.title || data?.title || title; break; }
-        } catch { /* try next */ }
+          // Try known response fields
+          const directUrl = data?.result?.download_url || data?.result?.dl || data?.data?.download_url ||
+            data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
+          if (directUrl && /^https?:\/\//i.test(directUrl)) {
+            audioUrl = directUrl;
+            finalTitle = data?.result?.title || data?.data?.title || data?.title || finalTitle;
+            break;
+          }
+          // Regex fallback for mp3/audio URLs
+          const match = flat.match(/https?:\/\/[^\s"']+\.(?:mp3|ogg|m4a|aac)[^\s"']*/i)
+            || flat.match(/https?:\/\/[^\s"']*(?:audio|ytmp3|mp3|download)[^\s"']*/i);
+          if (match) { audioUrl = match[0]; break; }
+        } catch {}
       }
-      if (!audioUrl) throw new Error('All download APIs failed. Try again later.');
-      await ctx.sock.sendMessage(ctx.chatId, {
-        audio: { url: audioUrl },
-        mimetype: 'audio/mpeg',
-        fileName: `${finalTitle.slice(0, 60)}.mp3`
-      }, { quoted: ctx.message });
-    } catch (err) {
-      await reply(ctx, `❌ Download failed: ${err.message}\n\n*Made by Kimani Samuel*`);
-    }
-  }});
 
+      if (!audioUrl) throw new Error('All download APIs failed. Try again later or use a direct YouTube link.');
+
+      // 3. Download the audio buffer
+      let audioBuffer;
+      try {
+        const resp = await axios.get(audioUrl, {
+          responseType: 'arraybuffer', timeout: 90000,
+          maxContentLength: Infinity, maxBodyLength: Infinity,
+          validateStatus: s => s >= 200 && s < 400,
+          headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*', 'Accept-Encoding': 'identity' }
+        });
+        audioBuffer = Buffer.from(resp.data);
+      } catch {
+        // Stream fallback
+        const resp = await axios.get(audioUrl, {
+          responseType: 'stream', timeout: 90000,
+          validateStatus: s => s >= 200 && s < 400,
+          headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*', 'Accept-Encoding': 'identity' }
+        });
+        const chunks = [];
+        await new Promise((resolve, reject) => {
+          resp.data.on('data', c => chunks.push(c));
+          resp.data.on('end', resolve);
+          resp.data.on('error', reject);
+        });
+        audioBuffer = Buffer.concat(chunks);
+      }
+
+      if (!audioBuffer || audioBuffer.length === 0) throw new Error('Downloaded audio is empty.');
+
+      // 4. Send the audio
+      const safeTitle = sanitizeFileName(finalTitle || 'song');
+      await ctx.sock.sendMessage(ctx.chatId, {
+        audio: audioBuffer,
+        mimetype: 'audio/mpeg',
+        fileName: `${safeTitle.slice(0, 60)}.mp3`,
+        ptt: false
+      }, { quoted: ctx.message });
+
+    } catch (err) {
+      let msg = `❌ Download failed: ${err.message}`;
+      if (/451|blocked|unavailable/i.test(err.message)) msg = '❌ Content blocked or unavailable in this region. Try a different song.';
+      await reply(ctx, msg + '\n\n*Made by Kimani Samuel*');
+    }
+  }})
   add({ name: 'video', aliases: ['ytmp4'], category: 'downloads', desc: 'Download YouTube media as video', usage: '<query/url>', handler: async (ctx) => {
     try { await sendYouTubeMedia(ctx, 'video', textArg(ctx.args)); }
     catch (err) { await reply(ctx, `Video download failed: ${err.message || err}`); }
@@ -1077,7 +1157,94 @@ ${toggles.join('\n')}
     } });
   }
 
-  const miscNames = ['clean','clear','cleartmp','delete','del','warnings','warn','resetwarn','topmembers','myactivity','groupstats','goodnight','lovenight','gn','shayari','roseday','heart','circle','lgbt','lolice','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','tweet','ytcomment','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','update','url','ss','ssweb','screenshot','presence','up','reject','translate','trt','translate2','trt2','tts','bio','character','wasted','emojimix','meme','memesearch','bomb','pingspam','newsletter','setnewsletter','setmenuimage','setbotname','broadcast','sudo','addsudo','delsudo','owners','repo','support','channel'];
+  // ─── DEL / DELETE: Admin delete messages ────────────────────────────────────
+  add({ name: 'delete', aliases: ['del'], category: 'group', groupOnly: true, adminOnly: true, desc: 'Delete replied message or last N messages from a user', usage: '[number] [@user]', handler: async (ctx) => {
+    const { sock, chatId, message, args } = ctx;
+    try { await ensureBotGroupAdmin(ctx, 'delete messages'); } catch (err) { return reply(ctx, err.message); }
+
+    const ctxInfo = message.message?.extendedTextMessage?.contextInfo || {};
+    const repliedParticipant = ctxInfo.participant || null;
+    const repliedMsgId = ctxInfo.stanzaId || null;
+    const mentioned = Array.isArray(ctxInfo.mentionedJid) && ctxInfo.mentionedJid.length > 0 ? ctxInfo.mentionedJid[0] : null;
+
+    let countArg = null;
+    const firstArg = parseInt(args[0], 10);
+    if (!isNaN(firstArg) && firstArg > 0) countArg = Math.min(firstArg, 50);
+
+    if (countArg === null && repliedParticipant) countArg = 1;
+    else if (countArg === null && !repliedParticipant && !mentioned) {
+      return reply(ctx, `❌ Usage:\n${ctx.prefix}del 5 — delete last 5 messages\n${ctx.prefix}del @user — delete last message from user\n${ctx.prefix}del (reply) — delete replied message`);
+    } else if (countArg === null && mentioned) countArg = 1;
+
+    // Delete the replied message directly if replying
+    if (repliedMsgId && repliedParticipant) {
+      try {
+        await sock.sendMessage(chatId, {
+          delete: { remoteJid: chatId, fromMe: false, id: repliedMsgId, participant: repliedParticipant }
+        });
+        if (countArg <= 1) return;
+        countArg = Math.max(0, countArg - 1);
+      } catch {}
+    }
+
+    // Use message store from index.js for bulk delete
+    const storeMap = ctx.messageStore;
+    if (!storeMap || !(storeMap instanceof Map)) {
+      return reply(ctx, '✅ Replied message deleted. For bulk delete, the message store is initializing.');
+    }
+
+    const chatMessages = [...storeMap.values()].filter(m => m.chatId === chatId);
+    chatMessages.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    const targetUser = repliedParticipant || mentioned || null;
+    const toDelete = [];
+    for (const m of chatMessages) {
+      if (toDelete.length >= countArg) break;
+      if (targetUser && m.sender !== targetUser) continue;
+      toDelete.push(m);
+    }
+    if (toDelete.length === 0) return reply(ctx, 'No recent messages found to delete.');
+    for (const m of toDelete) {
+      try {
+        await sock.sendMessage(chatId, {
+          delete: { remoteJid: chatId, fromMe: false, id: m.messageId || m.id || m.key?.id, participant: m.sender }
+        });
+        await new Promise(r => setTimeout(r, 300));
+      } catch {}
+    }
+  }});
+
+  // ─── PAY: Payment info command ────────────────────────────────────────────
+  add({ name: 'pay', aliases: ['payment', 'sendmoney', 'mpesa'], category: 'utility', desc: 'Show payment / M-Pesa info or generate a payment request', usage: '[amount] [reason]', handler: async (ctx) => {
+    const cfg = getConfig();
+    const input = textArg(ctx.args);
+    const ownerNumber = normalizeNumber(cfg.ownerNumber || OWNER_NUMBER);
+    const phone = ownerNumber ? `+${ownerNumber}` : 'Not set';
+
+    let amountLine = '';
+    let reasonLine = '';
+    if (input) {
+      const parts = input.split(/\s+/);
+      if (/^\d+(\.\d+)?$/.test(parts[0])) {
+        amountLine = `│ 💰 *Amount:* KES ${parseFloat(parts[0]).toFixed(2)}\n`;
+        reasonLine = parts.slice(1).join(' ') ? `│ 📝 *Reason:* ${parts.slice(1).join(' ')}\n` : '';
+      } else {
+        reasonLine = `│ 📝 *Reason:* ${input}\n`;
+      }
+    }
+
+    await reply(ctx, `╭─〔 💳 *PAYMENT INFO* 〕
+│
+│ 👑 *Owner:* ${cfg.ownerName || OWNER_NAME}
+│ 📞 *M-Pesa:* ${phone}
+│
+${amountLine}${reasonLine}│ _Send via M-Pesa then confirm with screenshot._
+╰────────────
+
+*Made by Kimani Samuel*`);
+  }});
+
+  // ─── Remaining misc stubs ─────────────────────────────────────────────────
+  const miscNames = ['clean','clear','cleartmp','warnings','warn','resetwarn','topmembers','myactivity','groupstats','goodnight','lovenight','gn','shayari','roseday','heart','circle','lgbt','lolice','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','tweet','ytcomment','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','update','url','ss','ssweb','screenshot','presence','up','reject','translate','trt','translate2','trt2','tts','bio','character','wasted','emojimix','meme','memesearch','bomb','pingspam','newsletter','setnewsletter','setmenuimage','setbotname','broadcast','sudo','addsudo','delsudo','owners','repo','support','channel'];
   for (const name of miscNames) {
     if (registry.has(name)) continue;
     add({ name, category: 'tools', desc: `${name} command`, handler: async (ctx) => reply(ctx, `${name} command is registered and working in the mega build.`) });
