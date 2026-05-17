@@ -124,9 +124,36 @@ function collectStringsDeep(value, out = []) {
 }
 
 async function ensureBotGroupAdmin(ctx, action = 'manage group members') {
-  const admins = await groupAdmins(ctx.sock, ctx.chatId).catch(() => []);
-  const botNumber = normalizeNumber(ctx.sock.user?.id || ctx.sock.user?.jid || '');
-  const isBotAdmin = admins.some(jid => normalizeNumber(jid) === botNumber || String(jid).includes(botNumber));
+  // Parse bot ID correctly — Baileys may return formats like:
+  //   "254701234567:4@s.whatsapp.net"  (phone:device@domain)
+  //   "30997433344120:4@lid"           (lid:device@lid)
+  const rawBotId  = ctx.sock.user?.id  || ctx.sock.user?.jid || '';
+  const rawBotLid = ctx.sock.user?.lid || '';
+
+  // Strip "@domain" and ":device" suffix to get the base number/lid
+  const stripSuffix = (jid = '') => jid.split('@')[0].split(':')[0];
+  const botPhone  = stripSuffix(rawBotId);
+  const botLid    = stripSuffix(rawBotLid);
+
+  let meta;
+  try { meta = await ctx.sock.groupMetadata(ctx.chatId); } catch {
+    throw new Error(`I need to be a group admin to ${action}.`);
+  }
+
+  const isBotAdmin = (meta.participants || []).some(p => {
+    const pId  = stripSuffix(p.id  || p.jid || '');
+    const pLid = stripSuffix(p.lid || '');
+    const isBot = (
+      rawBotId  === (p.id  || p.jid || '') ||   // exact full match
+      rawBotLid === (p.lid || '')           ||   // exact lid match
+      botPhone  === pId                     ||   // phone-number match
+      botPhone  === pLid                    ||   // phone vs lid
+      (botLid && botLid === pLid)           ||   // lid numeric match
+      (botLid && botLid === pId)                 // lid vs id
+    );
+    return isBot && (p.admin === 'admin' || p.admin === 'superadmin' || p.isAdmin);
+  });
+
   if (!isBotAdmin) throw new Error(`I need to be a group admin to ${action}.`);
 }
 
@@ -1023,14 +1050,48 @@ ${toggles.join('\n')}
 
       if (!audioBuffer || audioBuffer.length === 0) throw new Error('Downloaded audio is empty.');
 
-      // 4. Send the audio
+      // 4. Detect actual audio format from magic bytes
+      const magic4 = audioBuffer.slice(0, 4).toString('ascii');
+      const magic8ascii = audioBuffer.slice(4, 8).toString('ascii');
+      const isID3  = audioBuffer.slice(0, 3).toString('ascii') === 'ID3';
+      const isMPEG = audioBuffer[0] === 0xFF && (audioBuffer[1] & 0xE0) === 0xE0;
+      const isOGG  = magic4 === 'OggS';
+      const isWAV  = magic4 === 'RIFF';
+      const isFTYP = magic8ascii === 'ftyp';  // M4A / AAC / MP4 container
+
+      let mimetype = 'audio/mpeg';
+      let fileExt  = 'mp3';
+
+      if (isID3 || isMPEG) {
+        mimetype = 'audio/mpeg'; fileExt = 'mp3';
+      } else if (isOGG) {
+        mimetype = 'audio/ogg; codecs=opus'; fileExt = 'ogg';
+      } else if (isWAV) {
+        mimetype = 'audio/wav'; fileExt = 'wav';
+      } else if (isFTYP || !isID3) {
+        // M4A / AAC / anything else — send as document so WhatsApp won't reject it
+        mimetype = 'audio/mp4'; fileExt = 'm4a';
+      }
+
       const safeTitle = sanitizeFileName(finalTitle || 'song');
-      await ctx.sock.sendMessage(ctx.chatId, {
-        audio: audioBuffer,
-        mimetype: 'audio/mpeg',
-        fileName: `${safeTitle.slice(0, 60)}.mp3`,
-        ptt: false
-      }, { quoted: ctx.message });
+
+      if (fileExt === 'mp3' || fileExt === 'ogg') {
+        // WhatsApp natively plays MP3 and OGG — send as audio message
+        await ctx.sock.sendMessage(ctx.chatId, {
+          audio: audioBuffer,
+          mimetype,
+          fileName: `${safeTitle.slice(0, 60)}.${fileExt}`,
+          ptt: false
+        }, { quoted: ctx.message });
+      } else {
+        // M4A / WAV / unknown — send as playable document so it doesn't show "corrupted"
+        await ctx.sock.sendMessage(ctx.chatId, {
+          document: audioBuffer,
+          mimetype,
+          fileName: `${safeTitle.slice(0, 60)}.${fileExt}`,
+          caption: `🎵 *${safeTitle}*\n_Tap to play / download_\n\n*Made by Kimani Samuel*`
+        }, { quoted: ctx.message });
+      }
 
     } catch (err) {
       let msg = `❌ Download failed: ${err.message}`;
