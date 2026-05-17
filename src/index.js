@@ -273,19 +273,27 @@ async function sendError(sock, chatId, message, err) {
   await sock.sendMessage(chatId, { text: `Command failed: ${err.message || err}` }, { quoted: message }).catch(() => {});
 }
 
-// ─── ANTILINK: Detect and handle links in group messages ─────────────────────
+// ─── ANTILINK: Detect and handle links (delete or kick mode) ─────────────────
 async function handleLinkDetection(sock, message, chatId, sender, text, state) {
   if (!chatId.endsWith('@g.us')) return;
-  if (!isToggleEnabled(state, 'antilink')) return;
-  if (isOwnerJid(sender)) return; // don't enforce on owner
-  // Check if sender is admin
+  if (isOwnerJid(sender)) return;
+
+  // Read per-group config first, fall back to global toggle
+  const grpCfg = state.groupSettings?.[chatId]?.antilink;
+  const globalOn = isToggleEnabled(state, 'antilink');
+  const antilinkEnabled = grpCfg?.enabled ?? globalOn;
+  if (!antilinkEnabled) return;
+
+  const antilinkAction = grpCfg?.action || 'delete'; // 'delete' or 'kick'
+
+  // Admins are exempt
   try {
     const adminCheck = await isAdmin(sock, chatId, sender);
-    if (adminCheck) return; // admins are exempt
+    if (adminCheck) return;
   } catch {}
 
   const linkPatterns = [
-    /chat\.whatsapp\.com\/[A-Za-z0-9]{20,}/i,
+    /chat\.whatsapp\.com\/[A-Za-z0-9]{10,}/i,
     /wa\.me\/[A-Za-z0-9+]+/i,
     /t\.me\/[A-Za-z0-9_]+/i,
     /https?:\/\/\S+/i,
@@ -296,13 +304,25 @@ async function handleLinkDetection(sock, message, chatId, sender, text, state) {
   if (!hasLink) return;
 
   try {
+    // Always delete the message first
     await sock.sendMessage(chatId, {
       delete: { remoteJid: chatId, fromMe: false, id: message.key.id, participant: sender }
-    });
-    await sock.sendMessage(chatId, {
-      text: `⚠️ @${normalizeNumber(sender)}, links are not allowed in this group!`,
-      mentions: [sender]
-    });
+    }).catch(() => {});
+
+    if (antilinkAction === 'kick') {
+      // Kick mode: remove the sender
+      await sock.groupParticipantsUpdate(chatId, [sender], 'remove').catch(() => {});
+      await sock.sendMessage(chatId, {
+        text: `🚫 @${normalizeNumber(sender)} was removed for sending a link in this group.`,
+        mentions: [sender]
+      });
+    } else {
+      // Delete mode: warn only
+      await sock.sendMessage(chatId, {
+        text: `⚠️ @${normalizeNumber(sender)}, links are not allowed in this group! Next time you will be removed.`,
+        mentions: [sender]
+      });
+    }
   } catch (err) {
     console.warn('Antilink action failed:', err.message || err);
   }
@@ -846,7 +866,7 @@ async function startBot() {
   });
 
   // ─── GROUP EVENTS ─────────────────────────────────────────────────────────
-  sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+  sock.ev.on('group-participants.update', async ({ id, participants, action, author }) => {
     try {
       const st = getState();
       const groupSettings = st.groupSettings || {};
@@ -858,6 +878,42 @@ async function startBot() {
       if ((action === 'remove' || action === 'leave') && grpCfg.goodbye) {
         await handleGroupGoodbye(sock, id, participants);
       }
+
+      // ─── PROMOTE announcement ─────────────────────────────────────────
+      if (action === 'promote' && participants.length) {
+        try {
+          const pList = participants.map(j => typeof j === 'string' ? j : j.id || j.toString());
+          const userLines = pList.map(j => `• @${j.split('@')[0]}`).join('\n');
+          const authorJid = author ? (typeof author === 'string' ? author : author.id || author.toString()) : null;
+          const authorNum = authorJid ? authorJid.split('@')[0] : null;
+          const mentionList = [...pList, ...(authorJid ? [authorJid] : [])];
+          const msg =
+            `*『 GROUP PROMOTION 』*\n\n` +
+            `👥 *Promoted User${pList.length > 1 ? 's' : ''}:*\n${userLines}\n\n` +
+            `👑 *Promoted By:* ${authorNum ? `@${authorNum}` : 'System'}\n` +
+            `📅 *Date:* ${new Date().toLocaleString()}`;
+          await sock.sendMessage(id, { text: msg, mentions: mentionList });
+        } catch { /* ignore */ }
+      }
+
+      // ─── DEMOTE announcement ──────────────────────────────────────────
+      if (action === 'demote' && participants.length) {
+        try {
+          await new Promise(r => setTimeout(r, 800));
+          const pList = participants.map(j => typeof j === 'string' ? j : j.id || j.toString());
+          const userLines = pList.map(j => `• @${j.split('@')[0]}`).join('\n');
+          const authorJid = author ? (typeof author === 'string' ? author : author.id || author.toString()) : null;
+          const authorNum = authorJid ? authorJid.split('@')[0] : null;
+          const mentionList = [...pList, ...(authorJid ? [authorJid] : [])];
+          const msg =
+            `*『 GROUP DEMOTION 』*\n\n` +
+            `👤 *Demoted User${pList.length > 1 ? 's' : ''}:*\n${userLines}\n\n` +
+            `👑 *Demoted By:* ${authorNum ? `@${authorNum}` : 'System'}\n` +
+            `📅 *Date:* ${new Date().toLocaleString()}`;
+          await sock.sendMessage(id, { text: msg, mentions: mentionList });
+        } catch { /* ignore */ }
+      }
+
     } catch (err) {
       console.warn('Group participant event error:', err.message || err);
     }
