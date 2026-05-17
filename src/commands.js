@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
 import axios from 'axios';
+import { execSync, exec as execCb } from 'child_process';
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import { DATA_DIR, readJson, writeJson, runtime, systemInfo, normalizeNumber, mentionedJids, quotedParticipant, pickTarget, hashPercent, safeEvalMath, toFancy, randomChoice, groupAdmins } from './utils.js';
 import { formatPairingCode, pairInstructions, validatePairingNumber } from './pairing.js';
@@ -1566,8 +1567,185 @@ ${amountLine}${reasonLine}│ _Send via M-Pesa then confirm with screenshot._
 *Made by Kimani Samuel*`);
   }});
 
+
+  // ─── REPO: Bot source code repository ────────────────────────────────────────
+  add({ name: 'repo', aliases: ['source', 'sourcecode', 'github-repo'], category: 'owner', ownerOnly: true,
+    desc: 'Show the bot GitHub repository link',
+    handler: async (ctx) => {
+      const cfg = getConfig();
+      await reply(ctx,
+        `╭━━━━━━━━━━━━━━━━━━╮\n` +
+        `┃  🤖 *${cfg.botName || 'Malai-XD-2.0'} REPO*\n` +
+        `╰━━━━━━━━━━━━━━━━━━╯\n\n` +
+        `📦 *GitHub Repository:*\n` +
+        `https://github.com/Brokensmile47/Malai-XD-2.0--.git\n\n` +
+        `🌐 *Browse online:*\n` +
+        `https://github.com/Brokensmile47/Malai-XD-2.0--\n\n` +
+        `📥 *Clone:*\n` +
+        `\`git clone https://github.com/Brokensmile47/Malai-XD-2.0--.git\`\n\n` +
+        `⭐ Star the repo if you find it useful!\n` +
+        `_Made by Kimani Samuel_`
+      );
+    }
+  });
+
+  // ─── UPDATE: Pull latest code from GitHub and restart ─────────────────────
+  add({ name: 'update', aliases: ['gitpull', 'pullupdate', 'fetchupdate'], category: 'owner', ownerOnly: true,
+    desc: 'Pull latest updates from GitHub and restart the bot (auto on Render/Railway, manual on VPS/Linux)',
+    usage: '[force]',
+    handler: async (ctx) => {
+      const REPO_URL = 'https://github.com/Brokensmile47/Malai-XD-2.0--.git';
+      const cwd = process.cwd();
+      const isForce = (ctx.args[0] || '').toLowerCase() === 'force';
+
+      await reply(ctx, `🔄 *Checking for updates...*\n_Repo:_ ${REPO_URL}`);
+
+      // ── Helper: run shell command synchronously and return output ──
+      function run(cmd, options = {}) {
+        try {
+          return { ok: true, out: execSync(cmd, { cwd, encoding: 'utf8', timeout: 60000, ...options }).trim() };
+        } catch (e) {
+          return { ok: false, out: (e.stdout || e.stderr || e.message || String(e)).trim().slice(0, 500) };
+        }
+      }
+
+      // ── 1. Make sure this is a git repo, init remote if needed ──
+      const isGit = run('git rev-parse --git-dir');
+      if (!isGit.ok) {
+        // Not a git repo — initialize and set origin
+        run('git init');
+        run(`git remote add origin ${REPO_URL}`);
+        run('git fetch origin');
+        const initResult = run('git checkout -b main origin/main');
+        if (!initResult.ok) {
+          const initResult2 = run('git checkout -b main origin/master');
+          if (!initResult2.ok) {
+            return reply(ctx, `❌ *Could not initialize repo*\n${initResult2.out}\n\nTry cloning manually:\n\`git clone ${REPO_URL}\``);
+          }
+        }
+        return reply(ctx, `✅ *Repo initialized and bot updated from GitHub!*\nPlease restart the bot manually:\n\`npm start\``);
+      }
+
+      // ── 2. Check current remote ──
+      const remoteCheck = run('git remote get-url origin');
+      if (!remoteCheck.ok || !remoteCheck.out.includes('Brokensmile47')) {
+        run('git remote remove origin');
+        run(`git remote add origin ${REPO_URL}`);
+      }
+
+      // ── 3. Stash any local changes (protect session and .env) ──
+      if (isForce) {
+        run('git checkout -- .');
+        run('git clean -fd --exclude=session --exclude=.env --exclude=data');
+      } else {
+        run('git stash');
+      }
+
+      // ── 4. Fetch latest commits ──
+      const fetchResult = run('git fetch origin');
+      if (!fetchResult.ok) {
+        return reply(ctx, `❌ *Fetch failed — check internet connection*\n${fetchResult.out}`);
+      }
+
+      // ── 5. Get current vs remote commit ──
+      const currentBranch = run('git rev-parse --abbrev-ref HEAD');
+      const branch = currentBranch.out || 'main';
+      const localCommit = run('git rev-parse HEAD');
+      const remoteCommit = run(`git rev-parse origin/${branch}`);
+
+      if (localCommit.ok && remoteCommit.ok && localCommit.out === remoteCommit.out) {
+        // Restore stash if we stashed
+        if (!isForce) run('git stash pop');
+        return reply(ctx,
+          `✅ *Bot is already up to date!*\n\n` +
+          `📌 *Current commit:* \`${localCommit.out.slice(0, 8)}\`\n` +
+          `🌐 *Branch:* ${branch}\n` +
+          `🔗 Repo: ${REPO_URL}`
+        );
+      }
+
+      // ── 6. Pull / reset to remote ──
+      const pullResult = isForce
+        ? run(`git reset --hard origin/${branch}`)
+        : run(`git pull origin ${branch} --rebase`);
+
+      if (!pullResult.ok) {
+        if (!isForce) run('git stash pop');
+        return reply(ctx,
+          `❌ *Pull failed*\n${pullResult.out}\n\n` +
+          `Try: *${getConfig().prefix}update force* to discard local changes and force-pull.`
+        );
+      }
+
+      // ── 7. Get changelog (commits added) ──
+      const changelog = run(`git log --oneline origin/${branch}...HEAD@{1} 2>/dev/null || git log --oneline -5`);
+      const newCommit = run('git rev-parse HEAD');
+
+      // ── 8. Install any new dependencies ──
+      const hasPackageChange = run(`git diff HEAD@{1} HEAD -- package.json`);
+      let depsMsg = '';
+      if (hasPackageChange.out && hasPackageChange.out.length > 5) {
+        const npmResult = run('npm install --legacy-peer-deps', { timeout: 120000 });
+        depsMsg = npmResult.ok
+          ? '\n📦 *Dependencies updated successfully*'
+          : `\n⚠️ *Dependency install had issues:* ${npmResult.out.slice(0, 150)}`;
+      }
+
+      // ── 9. Build the response message ──
+      const changelogText = changelog.out
+        ? changelog.out.split('\n').slice(0, 8).map(l => `• ${l}`).join('\n')
+        : '• (no changelog available)';
+
+      // ── 10. Detect platform and decide restart method ──
+      const isRender  = !!process.env.RENDER;
+      const isRailway = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+      const isHeroku  = !!process.env.DYNO;
+      const isPm2     = !!process.env.PM2_HOME || !!process.env.pm_id || !!process.env.PM2_USAGE;
+      const isAutoHost = isRender || isRailway || isHeroku;
+
+      let restartMsg = '';
+      let willAutoRestart = false;
+
+      if (isPm2) {
+        // PM2 managed — restart via PM2
+        restartMsg = '\n🔁 *Restarting via PM2...*';
+        willAutoRestart = true;
+      } else if (isAutoHost) {
+        // Render/Railway/Heroku — process.exit triggers auto-restart by platform
+        restartMsg = '\n🔁 *Restarting automatically (platform managed)...*';
+        willAutoRestart = true;
+      } else {
+        // VPS/Termux/Linux — manual restart required
+        restartMsg =
+          '\n\n⚠️ *Manual restart required* (VPS/Linux/Termux detected)\n' +
+          'Stop the bot then run:\n```\nnpm start\n```\nor with PM2:\n```\npm2 restart all\n```';
+        willAutoRestart = false;
+      }
+
+      const successMsg =
+        `✅ *Bot Updated Successfully!*${depsMsg}\n\n` +
+        `📌 *New commit:* \`${(newCommit.out || '').slice(0, 8)}\`\n` +
+        `🌿 *Branch:* ${branch}\n` +
+        `🔗 *Repo:* ${REPO_URL}\n\n` +
+        `📝 *Changes:*\n${changelogText}` +
+        restartMsg;
+
+      await reply(ctx, successMsg);
+
+      // ── 11. Restart ──
+      if (willAutoRestart) {
+        await new Promise(r => setTimeout(r, 2000)); // give reply time to send
+        if (isPm2) {
+          execCb('pm2 restart all', () => {});
+        } else {
+          process.exit(0); // Render/Railway/Heroku auto-restarts
+        }
+      }
+    }
+  });
+
   // ─── Remaining misc stubs ─────────────────────────────────────────────────
-  const miscNames = ['clean','clear','cleartmp','warnings','warn','resetwarn','topmembers','myactivity','groupstats','goodnight','lovenight','gn','shayari','roseday','heart','circle','lgbt','lolice','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','tweet','ytcomment','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','update','url','ss','ssweb','screenshot','presence','up','reject','translate','trt','translate2','trt2','tts','bio','character','wasted','emojimix','meme','memesearch','bomb','pingspam','newsletter','setnewsletter','setmenuimage','setbotname','broadcast','sudo','addsudo','delsudo','owners','repo','support','channel'];
+  const miscNames = ['clean','clear','cleartmp','warnings','warn','resetwarn','topmembers','myactivity','groupstats','goodnight','lovenight','gn','shayari','roseday','heart','circle','lgbt','lolice','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','tweet','ytcomment','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','url','ss','ssweb','screenshot','presence','up','reject','translate','trt','translate2','trt2','tts','bio','character','wasted','emojimix','meme','memesearch','bomb','pingspam','newsletter','setnewsletter','setmenuimage','setbotname','broadcast','sudo','addsudo','delsudo','owners','support','channel'];
   for (const name of miscNames) {
     if (registry.has(name)) continue;
     add({ name, category: 'tools', desc: `${name} command`, handler: async (ctx) => reply(ctx, `${name} command is registered and working in the mega build.`) });
