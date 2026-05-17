@@ -9,6 +9,10 @@ import { formatPairingCode, pairInstructions, validatePairingNumber } from './pa
 import { BOT_NAME, OWNER_NAME, OWNER_NUMBER, TOGGLE_NAMES, commandReaction, formatAutoBio, formatSettings, getDateTimeParts, isToggleEnabled, setToggle } from './settings.js';
 import path from 'path';
 
+// yt-search — lazy top-level import so missing module never crashes startup
+let yts;
+try { yts = (await import('yt-search')).default; } catch { yts = null; }
+
 const configPath = path.join(DATA_DIR, 'bot-config.json');
 const statePath = path.join(DATA_DIR, 'state.json');
 
@@ -1011,165 +1015,108 @@ ${toggles.join('\n')}
 
   // ─── PLAY: Knightbot-MD style with keith API fallback ─────────────────────
   // ─── PLAY / SONG: Download YouTube audio (multi-API with fallback) ─────────
-  add({ name: 'play', aliases: ['song', 'song2', 'music', 'ytmp3'], category: 'downloads', desc: 'Download YouTube audio', usage: '<song name or URL>', handler: async (ctx) => {
-    const cfg = getConfig();
-    const query = textArg(ctx.args);
-    if (!query) return reply(ctx, `What song do you want to download?\nUsage: ${cfg.prefix}play <song name>`);
-    await reply(ctx, `🎵 _Searching for_ *${query}*...\n_Please wait, download in progress_ ⏳`);
-    try {
-      // 1. Resolve YouTube URL from search query
-      let youtubeUrl = '';
-      let videoTitle = query;
-      let videoThumb = '';
-      let videoDuration = '';
-
-      if (/^https?:\/\//i.test(query) && /youtube\.com|youtu\.be/i.test(query)) {
-        youtubeUrl = query;
-      } else {
-        try {
-          const yts = (await import('yt-search').catch(() => null))?.default;
-          if (yts) {
-            const result = await yts(query);
-            const video = result?.videos?.[0];
-            if (video?.url) {
-              youtubeUrl = video.url;
-              videoTitle = video.title || query;
-              videoThumb = video.thumbnail || '';
-              videoDuration = video.timestamp || '';
-            }
-          }
-        } catch {}
-      }
-      if (!youtubeUrl) throw new Error('Could not find that song on YouTube. Try a direct YouTube link.');
-
-      // Send thumbnail while downloading
-      if (videoThumb) {
-        try {
-          await ctx.sock.sendMessage(ctx.chatId, {
-            image: { url: videoThumb },
-            caption: `🎵 Downloading: *${videoTitle}*${videoDuration ? '\n⏱ Duration: ' + videoDuration : ''}`
-          }, { quoted: ctx.message });
-        } catch {}
-      }
-
-      // 2. Try multiple download APIs
-      const encoded = encodeURIComponent(youtubeUrl);
-      const apis = [
-        `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}`,
-        `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3`,
-        `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}`,
-        `https://api.davidcyriltech.my.id/download/ytmp3?url=${encoded}`,
-        `https://api.dreaded.site/api/ytdl/audio?url=${encoded}`,
-        `https://bk9.fun/download/ytmp3?url=${encoded}`,
-        `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}`
-      ];
-
-      const HEADERS = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, */*'
-      };
-
-      let audioUrl = '';
-      let finalTitle = videoTitle;
-
-      for (const api of apis) {
-        try {
-          const { data } = await axios.get(api, { timeout: 30000, headers: HEADERS });
-          const flat = JSON.stringify(data);
-          // Try known response fields
-          const directUrl = data?.result?.download_url || data?.result?.dl || data?.data?.download_url ||
-            data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
-          if (directUrl && /^https?:\/\//i.test(directUrl)) {
-            audioUrl = directUrl;
-            finalTitle = data?.result?.title || data?.data?.title || data?.title || finalTitle;
-            break;
-          }
-          // Regex fallback for mp3/audio URLs
-          const match = flat.match(/https?:\/\/[^\s"']+\.(?:mp3|ogg|m4a|aac)[^\s"']*/i)
-            || flat.match(/https?:\/\/[^\s"']*(?:audio|ytmp3|mp3|download)[^\s"']*/i);
-          if (match) { audioUrl = match[0]; break; }
-        } catch {}
-      }
-
-      if (!audioUrl) throw new Error('All download APIs failed. Try again later or use a direct YouTube link.');
-
-      // 3. Download the audio buffer
-      let audioBuffer;
+  add({
+    name: 'play',
+    aliases: ['song', 'music', 'ytmp3', 'song2'],
+    category: 'downloads',
+    desc: 'Download music from YouTube',
+    usage: '<song name or YouTube URL>',
+    handler: async (ctx) => {
       try {
-        const resp = await axios.get(audioUrl, {
-          responseType: 'arraybuffer', timeout: 90000,
-          maxContentLength: Infinity, maxBodyLength: Infinity,
-          validateStatus: s => s >= 200 && s < 400,
-          headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*', 'Accept-Encoding': 'identity' }
-        });
-        audioBuffer = Buffer.from(resp.data);
-      } catch {
-        // Stream fallback
-        const resp = await axios.get(audioUrl, {
-          responseType: 'stream', timeout: 90000,
-          validateStatus: s => s >= 200 && s < 400,
-          headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*', 'Accept-Encoding': 'identity' }
-        });
-        const chunks = [];
-        await new Promise((resolve, reject) => {
-          resp.data.on('data', c => chunks.push(c));
-          resp.data.on('end', resolve);
-          resp.data.on('error', reject);
-        });
-        audioBuffer = Buffer.concat(chunks);
-      }
+        const query = textArg(ctx.args);
 
-      if (!audioBuffer || audioBuffer.length === 0) throw new Error('Downloaded audio is empty.');
+        if (!query) {
+          return await reply(ctx, `Usage: ${getConfig().prefix}play <song name>`);
+        }
 
-      // 4. Detect actual audio format from magic bytes
-      const magic4 = audioBuffer.slice(0, 4).toString('ascii');
-      const magic8ascii = audioBuffer.slice(4, 8).toString('ascii');
-      const isID3  = audioBuffer.slice(0, 3).toString('ascii') === 'ID3';
-      const isMPEG = audioBuffer[0] === 0xFF && (audioBuffer[1] & 0xE0) === 0xE0;
-      const isOGG  = magic4 === 'OggS';
-      const isWAV  = magic4 === 'RIFF';
-      const isFTYP = magic8ascii === 'ftyp';  // M4A / AAC / MP4 container
+        await reply(ctx, '_Please wait your download is in progress_ ⏳');
 
-      let mimetype = 'audio/mpeg';
-      let fileExt  = 'mp3';
+        // Search YouTube
+        if (!yts) throw new Error('yt-search module not available on this host. Try: npm install yt-search');
+        const search = await yts(query);
+        const videos = search.videos;
 
-      if (isID3 || isMPEG) {
-        mimetype = 'audio/mpeg'; fileExt = 'mp3';
-      } else if (isOGG) {
-        mimetype = 'audio/ogg; codecs=opus'; fileExt = 'ogg';
-      } else if (isWAV) {
-        mimetype = 'audio/wav'; fileExt = 'wav';
-      } else if (isFTYP || !isID3) {
-        // M4A / AAC / anything else — send as document so WhatsApp won't reject it
-        mimetype = 'audio/mp4'; fileExt = 'm4a';
-      }
+        if (!videos || !videos.length) {
+          return await reply(ctx, '❌ No songs found for that query. Try different keywords.');
+        }
 
-      const safeTitle = sanitizeFileName(finalTitle || 'song');
+        const video = videos[0];
+        const youtubeUrl = video.url;
 
-      if (fileExt === 'mp3' || fileExt === 'ogg') {
-        // WhatsApp natively plays MP3 and OGG — send as audio message
+        // Try all download APIs in order
+        const encoded = encodeURIComponent(youtubeUrl);
+        const apis = [
+          `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}`,
+          `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3`,
+          `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}`,
+          `https://api.davidcyriltech.my.id/download/ytmp3?url=${encoded}`,
+          `https://api.dreaded.site/api/ytdl/audio?url=${encoded}`,
+          `https://bk9.fun/download/ytmp3?url=${encoded}`,
+          `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}`
+        ];
+
+        const HEADERS = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json, */*'
+        };
+
+        let audioUrl = '';
+        let finalTitle = video.title;
+
+        for (const api of apis) {
+          try {
+            const { data } = await axios.get(api, {
+              timeout: 30000,
+              headers: HEADERS
+            });
+
+            const directUrl =
+              data?.result?.downloadUrl ||
+              data?.result?.download_url ||
+              data?.result?.dl ||
+              data?.data?.download_url ||
+              data?.downloadURL ||
+              data?.dl ||
+              data?.download ||
+              data?.url ||
+              data?.link;
+
+            if (directUrl && /^https?:\/\//i.test(directUrl)) {
+              audioUrl = directUrl;
+              finalTitle =
+                data?.result?.title ||
+                data?.data?.title ||
+                data?.title ||
+                finalTitle;
+              break;
+            }
+          } catch { /* try next API */ }
+        }
+
+        if (!audioUrl) {
+          throw new Error('All download APIs failed. Please try again later.');
+        }
+
+        // Send audio exactly like Knightbot-MD — URL passthrough, no buffer downloading
         await ctx.sock.sendMessage(ctx.chatId, {
-          audio: audioBuffer,
-          mimetype,
-          fileName: `${safeTitle.slice(0, 60)}.${fileExt}`,
+          audio: { url: audioUrl },
+          mimetype: 'audio/mpeg',
+          fileName: `${sanitizeFileName(finalTitle).slice(0, 60)}.mp3`,
           ptt: false
-        }, { quoted: ctx.message });
-      } else {
-        // M4A / WAV / unknown — send as playable document so it doesn't show "corrupted"
-        await ctx.sock.sendMessage(ctx.chatId, {
-          document: audioBuffer,
-          mimetype,
-          fileName: `${safeTitle.slice(0, 60)}.${fileExt}`,
-          caption: `🎵 *${safeTitle}*\n_Tap to play / download_\n\n*Made by Kimani Samuel*`
-        }, { quoted: ctx.message });
-      }
+        }, {
+          quoted: ctx.message
+        });
 
-    } catch (err) {
-      let msg = `❌ Download failed: ${err.message}`;
-      if (/451|blocked|unavailable/i.test(err.message)) msg = '❌ Content blocked or unavailable in this region. Try a different song.';
-      await reply(ctx, msg + '\n\n*Made by Kimani Samuel*');
+      } catch (err) {
+        console.error('[play]', err);
+        let msg = `❌ Download failed: ${err.message}`;
+        if (/451|blocked|unavailable/i.test(err.message)) {
+          msg = '❌ Content blocked or unavailable in this region. Try another song.';
+        }
+        await reply(ctx, msg);
+      }
     }
-  }})
+  });
   add({ name: 'video', aliases: ['ytmp4'], category: 'downloads', desc: 'Download YouTube media as video', usage: '<query/url>', handler: async (ctx) => {
     try { await sendYouTubeMedia(ctx, 'video', textArg(ctx.args)); }
     catch (err) { await reply(ctx, `Video download failed: ${err.message || err}`); }
