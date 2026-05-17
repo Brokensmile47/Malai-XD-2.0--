@@ -780,9 +780,25 @@ async function handleMessage(sock, rawMessage) {
   }
 }
 
+async function fetchVersionSafe(timeoutMs = 8000) {
+  const fallback = [2, 3000, 1015901307];
+  try {
+    const result = await Promise.race([
+      fetchLatestBaileysVersion(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('fetchLatestBaileysVersion timeout')), timeoutMs)
+      )
+    ]);
+    return result;
+  } catch (e) {
+    console.warn(`⚠️  Could not fetch latest Baileys version (${e.message}). Using fallback version.`);
+    return { version: fallback, isLatest: false };
+  }
+}
+
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } = await fetchVersionSafe();
   const sock = makeWASocket({
     version,
     logger,
