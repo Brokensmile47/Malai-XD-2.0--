@@ -241,13 +241,15 @@ ${madeByFooter(cfg)}`;
 
 async function updateAutoBioFromCommand(ctx) {
   const cfg = getConfig();
-  const bio = formatAutoBio(cfg.botName || BOT_NAME, cfg.timeZone);
+  // Detect the sender's local timezone from their phone number
+  const senderTz = detectTimeZoneFromNumber(ctx.sender || '');
+  const bio = formatAutoBio(cfg.botName || BOT_NAME, senderTz);
   if (typeof ctx.sock.updateProfileStatus !== 'function') {
     return 'Autobio was enabled, but this Baileys socket does not expose updateProfileStatus on this host.';
   }
   try {
     await ctx.sock.updateProfileStatus(bio);
-    return `Bio updated: ${bio}`;
+    return `Bio updated using your local timezone (${senderTz}): ${bio}`;
   } catch (err) {
     return `Autobio was enabled, but updating bio failed: ${err.message || err}`;
   }
@@ -255,6 +257,60 @@ async function updateAutoBioFromCommand(ctx) {
 
 function sanitizeFileName(name = 'download') {
   return String(name).replace(/[\\/:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || 'download';
+}
+
+// Detect user's timezone from their phone number country code
+function detectTimeZoneFromNumber(jid = '') {
+  const num = normalizeNumber(jid) || '';
+  // Map country prefix → IANA timezone (most common)
+  const prefixMap = [
+    ['254', 'Africa/Nairobi'],   // Kenya
+    ['255', 'Africa/Dar_es_Salaam'], // Tanzania
+    ['256', 'Africa/Kampala'],   // Uganda
+    ['250', 'Africa/Kigali'],    // Rwanda
+    ['251', 'Africa/Addis_Ababa'], // Ethiopia
+    ['27', 'Africa/Johannesburg'], // South Africa
+    ['234', 'Africa/Lagos'],     // Nigeria
+    ['233', 'Africa/Accra'],     // Ghana
+    ['221', 'Africa/Dakar'],     // Senegal
+    ['237', 'Africa/Douala'],    // Cameroon
+    ['263', 'Africa/Harare'],    // Zimbabwe
+    ['260', 'Africa/Lusaka'],    // Zambia
+    ['265', 'Africa/Blantyre'],  // Malawi
+    ['258', 'Africa/Maputo'],    // Mozambique
+    ['267', 'Africa/Gaborone'],  // Botswana
+    ['1', 'America/New_York'],   // USA/Canada (ET default)
+    ['44', 'Europe/London'],     // UK
+    ['91', 'Asia/Kolkata'],      // India
+    ['92', 'Asia/Karachi'],      // Pakistan
+    ['971', 'Asia/Dubai'],       // UAE
+    ['966', 'Asia/Riyadh'],      // Saudi Arabia
+    ['880', 'Asia/Dhaka'],       // Bangladesh
+    ['62', 'Asia/Jakarta'],      // Indonesia
+    ['60', 'Asia/Kuala_Lumpur'], // Malaysia
+    ['65', 'Asia/Singapore'],    // Singapore
+    ['61', 'Australia/Sydney'],  // Australia
+    ['64', 'Pacific/Auckland'],  // New Zealand
+    ['49', 'Europe/Berlin'],     // Germany
+    ['33', 'Europe/Paris'],      // France
+    ['39', 'Europe/Rome'],       // Italy
+    ['34', 'Europe/Madrid'],     // Spain
+    ['7', 'Europe/Moscow'],      // Russia
+    ['86', 'Asia/Shanghai'],     // China
+    ['81', 'Asia/Tokyo'],        // Japan
+    ['82', 'Asia/Seoul'],        // South Korea
+    ['55', 'America/Sao_Paulo'], // Brazil
+    ['52', 'America/Mexico_City'], // Mexico
+    ['20', 'Africa/Cairo'],      // Egypt
+    ['212', 'Africa/Casablanca'], // Morocco
+    ['213', 'Africa/Algiers'],   // Algeria
+  ];
+  // Sort by length desc so longer prefixes match first (e.g. 254 before 2)
+  const sorted = prefixMap.sort((a, b) => b[0].length - a[0].length);
+  for (const [prefix, tz] of sorted) {
+    if (num.startsWith(prefix)) return tz;
+  }
+  return process.env.TIME_ZONE || process.env.TZ || 'Africa/Nairobi';
 }
 
 function isHttpUrl(text = '') {
@@ -417,18 +473,101 @@ export function buildCommands() {
     }
   }});
 
-  add({ name: 'allmenu', aliases: ['fullmenu', 'commands'], category: 'core', desc: 'Show every command by category', handler: async (ctx) => {
+  add({ name: 'allmenu', aliases: ['fullmenu', 'commands', 'allcommand'], category: 'core', desc: 'Show every command by category', handler: async (ctx) => {
     const cfg = getConfig();
+    const p = cfg.prefix;
     const grouped = {};
     for (const c of commands) (grouped[c.category] ||= []).push(c);
-    const parts = [`╭━━━〔 ALL COMMANDS: ${commands.length} 〕━━━╮`];
+
+    const CATEGORY_ICONS = {
+      core: '🌟', owner: '👑', group: '👥', downloads: '⬇️',
+      converter: '🎞️', tools: '🔧', utility: '🛠️', fun: '😂',
+      ai: '🤖', misc: '📦', informer: 'ℹ️', automation: '⚙️'
+    };
+
+    const header = `╔══════════════════════════════╗
+║  🤖 *${cfg.botName}* — Full Commands
+║  📦 Total: *${commands.length}*  |  🔣 Prefix: *${p}*
+║  👑 Owner: *${cfg.ownerName}*
+╚══════════════════════════════╝`;
+
+    const parts = [header];
     for (const cat of Object.keys(grouped).sort()) {
-      parts.push(`\n*${cat.toUpperCase()}*`);
-      parts.push(grouped[cat].map(c => helpLine(c, cfg.prefix)).join('\n'));
+      const icon = CATEGORY_ICONS[cat] || '📌';
+      const cmds = grouped[cat];
+      parts.push(`\n╭─── ${icon} *${cat.toUpperCase()}* (${cmds.length}) ───`);
+      for (const c of cmds) {
+        const usage = c.usage ? ` *${c.usage}*` : '';
+        parts.push(`│ ➤ ${p}${c.name}${usage}`);
+        if (c.aliases?.length) parts.push(`│    _aliases: ${c.aliases.map(a => p + a).join(', ')}_`);
+      }
+      parts.push(`╰${'─'.repeat(30)}`);
     }
-    parts.push(`\n╰━━━━━━━━━━━━━━━━━━━━╯\n${madeByFooter(cfg)}`);
+    parts.push(`\n_Type *${p}menu* for a quick overview_\n${madeByFooter(cfg)}`);
+
     await sendLongReply(ctx, parts.join('\n'));
   }});
+
+  add({ name: 'ownermenu', aliases: ['adminmenu', 'ownercommands'], category: 'owner', ownerOnly: true, desc: 'Show all owner-only commands in a stylistic list', handler: async (ctx) => {
+    const cfg = getConfig();
+    const p = cfg.prefix;
+    const ownerCmds = commands.filter(c => c.ownerOnly);
+
+    const menu = `╔══════════════════════════════╗
+║  👑 *OWNER COMMANDS PANEL*
+║  🤖 Bot: *${cfg.botName}*
+║  📦 Commands: *${ownerCmds.length}*
+╚══════════════════════════════╝
+
+╭─── ⚙️ *BOT CONTROL* ───
+│ ➤ ${p}mode <public|private>
+│ ➤ ${p}setprefix <prefix>
+│ ➤ ${p}setbotname <name>
+│ ➤ ${p}setbotpp  _(reply to image)_
+│ ➤ ${p}restart
+│ ➤ ${p}update
+╰──────────────────────────────
+
+╭─── 🔧 *SETTINGS & TOGGLES* ───
+│ ➤ ${p}settings
+│ ➤ ${p}autobio on/off
+│ ➤ ${p}autotyping on/off
+│ ➤ ${p}autorecord on/off
+│ ➤ ${p}autostatus on/off
+│ ➤ ${p}antilink on/off
+│ ➤ ${p}anticall on/off
+│ ➤ ${p}pmblocker on/off
+│ ➤ ${p}autoread on/off
+│ ➤ ${p}welcome on/off
+│ ➤ ${p}goodbye on/off
+╰──────────────────────────────
+
+╭─── 🚫 *USER MANAGEMENT* ───
+│ ➤ ${p}ban / ${p}unban @user
+│ ➤ ${p}block / ${p}unblock @user
+│ ➤ ${p}sudo / ${p}addsudo / ${p}delsudo
+│ ➤ ${p}broadcast <message>
+╰──────────────────────────────
+
+╭─── 🔗 *PAIRING & SESSION* ───
+│ ➤ ${p}pair <number>
+│ ➤ ${p}clearsession
+╰──────────────────────────────
+
+╭─── 📊 *INFO & STATS* ───
+│ ➤ ${p}ping2 _(system status)_
+│ ➤ ${p}system
+│ ➤ ${p}runtime
+│ ➤ ${p}owners
+│ ➤ ${p}repo
+╰──────────────────────────────
+
+${madeByFooter(cfg)}`;
+
+    await reply(ctx, menu);
+  }});
+
+
 
   add({ name: 'ping', aliases: ['speed', 'latency'], category: 'core', desc: 'Check bot response speed', handler: async (ctx) => {
     const cfg = getConfig();
@@ -810,15 +949,15 @@ ${toggles.join('\n')}
     await ensureBotGroupAdmin(ctx, 'approve join requests');
     let targets = jidsFromArgs(ctx);
     const wantsAll = ctx.commandName === 'approveall' || !targets.length || /^(all)$/i.test(ctx.args[0] || '');
-    if (wantsAll && typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu === 'function') {
-      const pending = await ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu(ctx.chatId).catch(() => []);
+    if (wantsAll && typeof ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu === 'function') {
+      const pending = await ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu(ctx.chatId).catch(() => []);
       targets = (pending || []).map(p => p.jid || p.id).filter(Boolean);
     }
     if (!targets.length) return reply(ctx, 'No pending requests found. You can also mention a user or type their number.');
-    if (typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu !== 'function') {
+    if (typeof ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu !== 'function') {
       return reply(ctx, 'This Baileys version/WhatsApp account does not expose pending request approval on this host.');
     }
-    const result = await ctx.sock.gerror code: 522(ctx.chatId, targets, 'approve');
+    const result = await ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu(ctx.chatId, targets, 'approve');
     await reply(ctx, `Approved ${formatTargetList(targets)}${result ? `\nResult: ${JSON.stringify(result).slice(0, 900)}` : ''}`, { mentions: targets });
   }});
   add({ name: 'block', category: 'owner', ownerOnly: true, desc: 'Block a WhatsApp user by reply, mention, or number', usage: '@user | +254...', handler: async (ctx) => {
@@ -1013,8 +1152,7 @@ ${toggles.join('\n')}
     add({ name, category: 'converter', desc: `${name} media command`, handler: async (ctx) => reply(ctx, `${name} is registered. Reply to media with ${getConfig().prefix}${name}. Full conversion needs ffmpeg/sharp support on the host.`) });
   }
 
-  // ─── PLAY: Knightbot-MD style with keith API fallback ─────────────────────
-  // ─── PLAY / SONG: Download YouTube audio (multi-API with fallback) ─────────
+  // ─── PLAY / SONG: Download YouTube audio (Knightbot-MD style with multi-API fallback) ──
   add({
     name: 'play',
     aliases: ['song', 'music', 'ytmp3', 'song2'],
@@ -1024,102 +1162,188 @@ ${toggles.join('\n')}
     handler: async (ctx) => {
       try {
         const query = textArg(ctx.args);
+        if (!query) return await reply(ctx, `Usage: ${getConfig().prefix}play <song name or YouTube link>`);
 
-        if (!query) {
-          return await reply(ctx, `Usage: ${getConfig().prefix}play <song name>`);
-        }
-
-        await reply(ctx, '_Please wait your download is in progress_ ⏳');
-
-        // Search YouTube
-        if (!yts) throw new Error('yt-search module not available on this host. Try: npm install yt-search');
+        if (!yts) throw new Error('yt-search module not available. Try: npm install yt-search');
         const search = await yts(query);
-        const videos = search.videos;
-
-        if (!videos || !videos.length) {
-          return await reply(ctx, '❌ No songs found for that query. Try different keywords.');
-        }
+        const videos = search?.videos || [];
+        if (!videos.length) return await reply(ctx, '❌ No songs found for that query. Try different keywords.');
 
         const video = videos[0];
+
+        // Send thumbnail preview like Knightbot-MD
+        try {
+          if (video.thumbnail) {
+            await ctx.sock.sendMessage(ctx.chatId, {
+              image: { url: video.thumbnail },
+              caption: `🎵 *Downloading:* ${video.title}\n⏱ *Duration:* ${video.timestamp || video.duration?.timestamp || 'N/A'}`
+            }, { quoted: ctx.message });
+          }
+        } catch { /* thumbnail send failed, continue */ }
+
         const youtubeUrl = video.url;
-
-        // Try all download APIs in order
         const encoded = encodeURIComponent(youtubeUrl);
-        const apis = [
-          `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}`,
-          `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3`,
-          `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}`,
-          `https://api.davidcyriltech.my.id/download/ytmp3?url=${encoded}`,
-          `https://api.dreaded.site/api/ytdl/audio?url=${encoded}`,
-          `https://bk9.fun/download/ytmp3?url=${encoded}`,
-          `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}`
-        ];
-
         const HEADERS = {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'application/json, */*'
         };
 
+        // Multi-API fallback chain (Knightbot-MD approach)
+        const apiMethods = [
+          { name: ' keith', url: `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}` },
+          { name: 'EliteProTech', url: `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3` },
+          { name: 'Yupra', url: `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}` },
+          { name: 'Okatsu', url: `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}` },
+          { name: 'davidcyril', url: `https://api.davidcyriltech.my.id/download/ytmp3?url=${encoded}` },
+          { name: 'dreaded', url: `https://api.dreaded.site/api/ytdl/audio?url=${encoded}` },
+          { name: 'bk9', url: `https://bk9.fun/download/ytmp3?url=${encoded}` },
+          { name: 'agatz', url: `https://api.agatz.xyz/api/ytmp3?url=${encoded}` }
+        ];
+
         let audioUrl = '';
-        let finalTitle = video.title;
+        let finalTitle = sanitizeFileName(video.title || 'song');
 
-        for (const api of apis) {
+        for (const api of apiMethods) {
           try {
-            const { data } = await axios.get(api, {
-              timeout: 30000,
-              headers: HEADERS
-            });
-
-            const directUrl =
-              data?.result?.downloadUrl ||
-              data?.result?.download_url ||
-              data?.result?.dl ||
-              data?.data?.download_url ||
-              data?.downloadURL ||
-              data?.dl ||
-              data?.download ||
-              data?.url ||
-              data?.link;
-
-            if (directUrl && /^https?:\/\//i.test(directUrl)) {
-              audioUrl = directUrl;
-              finalTitle =
-                data?.result?.title ||
-                data?.data?.title ||
-                data?.title ||
-                finalTitle;
+            const { data } = await axios.get(api.url, { timeout: 30000, headers: HEADERS });
+            const url =
+              data?.result?.downloadUrl || data?.result?.download_url || data?.result?.dl ||
+              data?.data?.download_url || data?.data?.dl ||
+              data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
+            if (url && /^https?:\/\//i.test(url)) {
+              audioUrl = url;
+              const t = data?.result?.title || data?.data?.title || data?.title;
+              if (t) finalTitle = sanitizeFileName(t);
               break;
             }
-          } catch { /* try next API */ }
+          } catch { /* try next */ }
         }
 
-        if (!audioUrl) {
-          throw new Error('All download APIs failed. Please try again later.');
+        if (!audioUrl) throw new Error('All download APIs failed. Please try again later or try a direct YouTube link.');
+
+        // Download audio buffer and detect format (Knightbot-MD style)
+        let audioBuffer;
+        try {
+          const resp = await axios.get(audioUrl, {
+            responseType: 'arraybuffer', timeout: 90000,
+            maxContentLength: Infinity, maxBodyLength: Infinity,
+            validateStatus: s => s >= 200 && s < 400,
+            headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*', 'Accept-Encoding': 'identity' }
+          });
+          audioBuffer = Buffer.from(resp.data);
+        } catch {
+          // Fallback: stream download
+          const resp = await axios.get(audioUrl, {
+            responseType: 'stream', timeout: 90000,
+            maxContentLength: Infinity, maxBodyLength: Infinity,
+            validateStatus: s => s >= 200 && s < 400,
+            headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*', 'Accept-Encoding': 'identity' }
+          });
+          const chunks = [];
+          await new Promise((res, rej) => {
+            resp.data.on('data', c => chunks.push(c));
+            resp.data.on('end', res);
+            resp.data.on('error', rej);
+          });
+          audioBuffer = Buffer.concat(chunks);
         }
 
-        // Send audio exactly like Knightbot-MD — URL passthrough, no buffer downloading
+        if (!audioBuffer || audioBuffer.length === 0) throw new Error('Downloaded audio buffer is empty.');
+
+        // Detect actual file format from magic bytes
+        const sig = audioBuffer.slice(0, 12);
+        const ascii4 = sig.slice(4, 8).toString('ascii');
+        let mimetype = 'audio/mpeg';
+        let fileName = `${finalTitle.slice(0, 60)}.mp3`;
+        if (ascii4 === 'ftyp') { mimetype = 'audio/mp4'; fileName = `${finalTitle.slice(0, 60)}.m4a`; }
+        else if (sig.toString('ascii', 0, 4) === 'OggS') { mimetype = 'audio/ogg; codecs=opus'; fileName = `${finalTitle.slice(0, 60)}.ogg`; }
+        else if (sig.toString('ascii', 0, 4) === 'RIFF') { mimetype = 'audio/wav'; fileName = `${finalTitle.slice(0, 60)}.wav`; }
+
         await ctx.sock.sendMessage(ctx.chatId, {
-          audio: { url: audioUrl },
-          mimetype: 'audio/mpeg',
-          fileName: `${sanitizeFileName(finalTitle).slice(0, 60)}.mp3`,
+          audio: audioBuffer,
+          mimetype,
+          fileName,
           ptt: false
-        }, {
-          quoted: ctx.message
-        });
+        }, { quoted: ctx.message });
 
       } catch (err) {
         console.error('[play]', err);
         let msg = `❌ Download failed: ${err.message}`;
-        if (/451|blocked|unavailable/i.test(err.message)) {
-          msg = '❌ Content blocked or unavailable in this region. Try another song.';
-        }
+        if (/451|blocked|unavailable/i.test(err.message)) msg = '❌ Content blocked or unavailable in this region. Try another song.';
+        if (/All download APIs failed/i.test(err.message)) msg = '❌ All download sources failed. The content may be unavailable or blocked.';
         await reply(ctx, msg);
       }
     }
   });
-  add({ name: 'video', aliases: ['ytmp4'], category: 'downloads', desc: 'Download YouTube media as video', usage: '<query/url>', handler: async (ctx) => {
-    try { await sendYouTubeMedia(ctx, 'video', textArg(ctx.args)); }
-    catch (err) { await reply(ctx, `Video download failed: ${err.message || err}`); }
+  add({ name: 'video', aliases: ['ytmp4'], category: 'downloads', desc: 'Download YouTube video (MP4)', usage: '<song name or YouTube URL>', handler: async (ctx) => {
+    try {
+      const query = textArg(ctx.args);
+      if (!query) return reply(ctx, `Usage: ${getConfig().prefix}video <song name or YouTube link>`);
+
+      if (!yts) throw new Error('yt-search module not available. Try: npm install yt-search');
+      const search = await yts(query);
+      const videos = search?.videos || [];
+      if (!videos.length) return reply(ctx, '❌ No videos found. Try different keywords.');
+
+      const video = videos[0];
+
+      // Send thumbnail immediately like Knightbot-MD
+      try {
+        if (video.thumbnail) {
+          await ctx.sock.sendMessage(ctx.chatId, {
+            image: { url: video.thumbnail },
+            caption: `🎬 *${video.title}*\n⏱ *Duration:* ${video.timestamp || 'N/A'}\n⬇️ Downloading...`
+          }, { quoted: ctx.message });
+        }
+      } catch { /* continue */ }
+
+      const encoded = encodeURIComponent(video.url);
+      const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36', 'Accept': 'application/json, */*' };
+
+      const apiMethods = [
+        { name: 'EliteProTech', url: `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp4` },
+        { name: 'Yupra', url: `https://api.yupra.my.id/api/downloader/ytmp4?url=${encoded}` },
+        { name: 'Okatsu', url: `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp4?url=${encoded}` },
+        { name: 'davidcyril', url: `https://api.davidcyriltech.my.id/download/ytmp4?url=${encoded}` },
+        { name: 'dreaded', url: `https://api.dreaded.site/api/ytdl/video?url=${encoded}` },
+        { name: 'bk9', url: `https://bk9.fun/download/ytmp4?url=${encoded}` },
+        { name: 'agatz', url: `https://api.agatz.xyz/api/ytmp4?url=${encoded}` }
+      ];
+
+      let videoUrl = '';
+      let finalTitle = sanitizeFileName(video.title || 'video');
+
+      for (const api of apiMethods) {
+        try {
+          const { data } = await axios.get(api.url, { timeout: 30000, headers: HEADERS });
+          const url =
+            data?.result?.mp4 || data?.result?.download_url || data?.result?.dl ||
+            data?.data?.download_url || data?.data?.dl ||
+            data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
+          if (url && /^https?:\/\//i.test(url)) {
+            videoUrl = url;
+            const t = data?.result?.title || data?.data?.title || data?.title;
+            if (t) finalTitle = sanitizeFileName(t);
+            break;
+          }
+        } catch { /* try next */ }
+      }
+
+      if (!videoUrl) throw new Error('All download APIs failed. Please try again later or use a direct YouTube link.');
+
+      await ctx.sock.sendMessage(ctx.chatId, {
+        video: { url: videoUrl },
+        mimetype: 'video/mp4',
+        fileName: `${finalTitle.slice(0, 60)}.mp4`,
+        caption: `╭─〔 🎬 *Video Download* 〕\n│ *${finalTitle.slice(0, 80)}*\n╰────────────\n\n_Powered by ${getConfig().botName}_`
+      }, { quoted: ctx.message });
+
+    } catch (err) {
+      console.error('[video]', err);
+      let msg = `❌ Video download failed: ${err.message}`;
+      if (/451|blocked/i.test(err.message)) msg = '❌ Content blocked or unavailable. Try another video.';
+      await reply(ctx, msg);
+    }
   }});
   add({ name: 'youtube', aliases: ['yt'], category: 'downloads', desc: 'Download YouTube audio or video', usage: '<audio|video> <query/url>', handler: async (ctx) => {
     const first = (ctx.args[0] || '').toLowerCase();
@@ -1691,71 +1915,88 @@ ${amountLine}${reasonLine}│ _Send via M-Pesa then confirm with screenshot._
     }
   });
 
+  // ─── PRESENCE: Show autorecord and autotyping status ──────────────────────
+  add({ name: 'presence', aliases: ['presencestatus'], category: 'tools', ownerOnly: true, desc: 'Show or toggle presence settings (autotyping, autorecord)', usage: '[autotyping|autorecord] [on|off]', handler: async (ctx) => {
+    const cfg = getConfig();
+    const st = getState();
+    const arg1 = (ctx.args[0] || '').toLowerCase();
+    const arg2 = (ctx.args[1] || '').toLowerCase();
+
+    // Toggle a specific presence setting
+    if (['autotyping', 'autorecord'].includes(arg1) && ['on', 'off'].includes(arg2)) {
+      setToggle(st, arg1, arg2 === 'on');
+      saveState(st);
+      return reply(ctx, `✅ *${arg1}* → *${arg2.toUpperCase()}*\n\nUse ${cfg.prefix}presence to see full status.`);
+    }
+
+    const typingOn = isToggleEnabled(st, 'autotyping');
+    const recordOn = isToggleEnabled(st, 'autorecord');
+
+    const board = `╔══════════════════════════════╗
+║  📡 *PRESENCE STATUS*
+╠══════════════════════════════╣
+║
+║  ⌨️  *Autotyping:*   ${typingOn  ? '✅ ENABLED ' : '❌ DISABLED'}
+║  🎙️ *Autorecord:*   ${recordOn  ? '✅ ENABLED ' : '❌ DISABLED'}
+║
+╠══════════════════════════════╣
+║ _Toggle with:_
+║  ${cfg.prefix}presence autotyping on/off
+║  ${cfg.prefix}autorecord on/off
+║  ${cfg.prefix}autotyping on/off
+╚══════════════════════════════╝
+
+${madeByFooter(cfg)}`;
+    await reply(ctx, board);
+  }});
+
+  // ─── SETBOTNAME: Change bot display name ──────────────────────────────────
+  add({ name: 'setbotname', aliases: ['botname', 'changebotname'], category: 'owner', ownerOnly: true, desc: 'Change the bot display name', usage: '<new name>', handler: async (ctx) => {
+    const newName = textArg(ctx.args).trim();
+    if (!newName) return reply(ctx, `Usage: ${getConfig().prefix}setbotname <new name>\nExample: ${getConfig().prefix}setbotname Malai-Pro`);
+    if (newName.length < 2 || newName.length > 50) return reply(ctx, '❌ Bot name must be between 2 and 50 characters.');
+    saveConfig({ botName: newName });
+    // Also try to update the WhatsApp profile name
+    let profileMsg = '';
+    try {
+      if (typeof ctx.sock.updateProfileName === 'function') {
+        await ctx.sock.updateProfileName(newName);
+        profileMsg = '\n✅ WhatsApp profile name also updated.';
+      }
+    } catch (e) {
+      profileMsg = `\n⚠️ Config saved but WhatsApp profile update failed: ${e.message}`;
+    }
+    await reply(ctx, `✅ *Bot name updated!*\n\n🤖 New name: *${newName}*${profileMsg}\n\n_Use ${getConfig().prefix}ping to confirm._`);
+  }});
+
+  // ─── SETBOTPP: Change bot profile picture ────────────────────────────────
+  add({ name: 'setbotpp', aliases: ['setbotimage', 'botpp', 'changebotpp'], category: 'owner', ownerOnly: true, desc: 'Change the bot profile picture — reply to an image', handler: async (ctx) => {
+    const quoted = ctx.message?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    const imgMsg = ctx.message?.message?.imageMessage || quoted?.imageMessage;
+    if (!imgMsg) return reply(ctx, `❌ Please reply to an image with ${getConfig().prefix}setbotpp to set the bot profile picture.`);
+    try {
+      const stream = await downloadContentFromMessage(imgMsg, 'image');
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      const buffer = Buffer.concat(chunks);
+      if (typeof ctx.sock.updateProfilePicture !== 'function') {
+        return reply(ctx, '❌ This Baileys version does not support updateProfilePicture on this host.');
+      }
+      const botJid = ctx.sock.user?.id || ctx.sock.user?.jid;
+      if (!botJid) return reply(ctx, '❌ Could not determine bot JID. Try again after the bot is fully connected.');
+      await ctx.sock.updateProfilePicture(botJid, buffer);
+      await reply(ctx, '✅ *Bot profile picture updated successfully!*');
+    } catch (err) {
+      await reply(ctx, `❌ Failed to update profile picture: ${err.message || err}`);
+    }
+  }});
+
   // ─── Remaining misc stubs ─────────────────────────────────────────────────
-  const miscNames = ['clean','clear','cleartmp','warnings','warn','resetwarn','topmembers','myactivity','groupstats','goodnight','lovenight','gn','shayari','roseday','heart','circle','lgbt','lolice','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','tweet','ytcomment','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','url','ss','ssweb','screenshot','presence','up','reject','translate','trt','translate2','trt2','tts','bio','character','wasted','emojimix','meme','memesearch','bomb','pingspam','newsletter','setnewsletter','setmenuimage','setbotname','broadcast','sudo','addsudo','delsudo','owners','support','channel'];
+  const miscNames = ['clean','clear','cleartmp','warnings','warn','resetwarn','topmembers','myactivity','groupstats','goodnight','lovenight','gn','shayari','roseday','heart','circle','lgbt','lolice','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','tweet','ytcomment','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','url','ss','ssweb','screenshot','up','reject','translate','trt','translate2','trt2','tts','bio','character','wasted','emojimix','meme','memesearch','bomb','pingspam','newsletter','setnewsletter','setmenuimage','broadcast','sudo','addsudo','delsudo','owners','support','channel'];
   for (const name of miscNames) {
     if (registry.has(name)) continue;
     add({ name, category: 'tools', desc: `${name} command`, handler: async (ctx) => reply(ctx, `${name} command is registered and working in the mega build.`) });
   }
-
-
-  add({ name: 'ownermenu', aliases: ['ownerpanel'], category: 'core', desc: 'Stylish owner command menu', handler: async (ctx) => {
-    const cfg = getConfig();
-    const msg = `╭━━〔 👑 OWNER MENU 👑 〕━━⬣
-┃ Bot: ${cfg.botName}
-┃ Owner: ${cfg.ownerName}
-┃ Prefix: ${cfg.prefix}
-╰━━━━━━━━━━━━━━━━⬣
-
-╭─❖ OWNER CONTROLS
-┃ ${cfg.prefix}setbotname <name>
-┃ ${cfg.prefix}setmenuimage (reply image)
-┃ ${cfg.prefix}presence
-┃ ${cfg.prefix}autobio on/off
-┃ ${cfg.prefix}autorecord on/off
-┃ ${cfg.prefix}autotyping on/off
-┃ ${cfg.prefix}restart
-╰──────────────⬣
-
-╭─❖ SYSTEM
-┃ Runtime: ${runtime()}
-┃ Mode: ${cfg.publicMode ? 'Public' : 'Private'}
-╰──────────────⬣`;
-    await reply(ctx, msg);
-  }});
-
-  add({ name: 'presence', aliases: ['presencestatus'], category: 'tools', desc: 'Show fake presence status', handler: async (ctx) => {
-    const state = getState();
-    const line = (name) => `• ${name}: ${isToggleEnabled(state, name) ? 'Enabled ✅' : 'Disabled ❌'}`;
-    await reply(ctx, `╭━━〔 PRESENCE STATUS 〕━━⬣
-${line('autorecord')}
-${line('autotyping')}
-${line('autoread')}
-${line('autobio')}
-╰━━━━━━━━━━━━━━━━━━⬣`);
-  }});
-
-  add({ name: 'setbotname', category: 'owner', ownerOnly: true, desc: 'Change bot name', usage: '<new name>', handler: async (ctx) => {
-    const newName = textArg(ctx.args).trim();
-    if (!newName) return reply(ctx, `Usage: ${getConfig().prefix}setbotname <new name>`);
-    saveConfig({ botName: newName });
-    await reply(ctx, `✅ Bot name updated to: ${newName}`);
-  }});
-
-  add({ name: 'setmenuimage', aliases: ['setbotimage'], category: 'owner', ownerOnly: true, desc: 'Change bot/menu image', handler: async (ctx) => {
-    const quoted = ctx.message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    const imageMsg = quoted?.imageMessage || ctx.message.message?.imageMessage;
-    if (!imageMsg) return reply(ctx, 'Reply to an image with setmenuimage.');
-    const stream = await downloadContentFromMessage(imageMsg, 'image');
-    let buffer = Buffer.from([]);
-    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-    const assetDir = path.join(process.cwd(), 'assets');
-    fs.mkdirSync(assetDir, { recursive: true });
-    fs.writeFileSync(path.join(assetDir, 'malai_avatar.jpg'), buffer);
-    fs.writeFileSync(path.join(assetDir, 'bot_image.jpg'), buffer);
-    await reply(ctx, '✅ Bot image updated successfully.');
-  }});
-
 
   return { commands, registry, getConfig, getState };
 }
