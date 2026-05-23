@@ -224,18 +224,15 @@ async function sendConnectedNotice(sock) {
   lastConnectedNoticeAt = now;
 
   const cfg = getConfig();
-  const botNumber = normalizeNumber(sock.user?.id || sock.user?.jid || '');
   const ownerNumber = normalizeNumber(cfg.ownerNumber || OWNER_NUMBER);
-  const recipients = new Set();
-  if (ownerNumber) recipients.add(`${ownerNumber}@s.whatsapp.net`);
+  if (!ownerNumber) return; // No owner configured, skip
 
+  const ownerJid = `${ownerNumber}@s.whatsapp.net`;
   const text = `✅ ${cfg.botName || BOT_NAME} connected successfully.\nRuntime: ${runtime()}\nOwner: +${ownerNumber}`;
-  for (const jid of recipients) {
-    try {
-      await sock.sendMessage(jid, { text });
-    } catch (err) {
-      console.warn(`Connected notice failed for ${jid}: ${err.message || err}`);
-    }
+  try {
+    await sock.sendMessage(ownerJid, { text });
+  } catch (err) {
+    console.warn(`Connected notice failed for owner ${ownerJid}: ${err.message || err}`);
   }
 }
 
