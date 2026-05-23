@@ -227,7 +227,6 @@ async function sendConnectedNotice(sock) {
   const botNumber = normalizeNumber(sock.user?.id || sock.user?.jid || '');
   const ownerNumber = normalizeNumber(cfg.ownerNumber || OWNER_NUMBER);
   const recipients = new Set();
-  if (botNumber) recipients.add(`${botNumber}@s.whatsapp.net`);
   if (ownerNumber) recipients.add(`${ownerNumber}@s.whatsapp.net`);
 
   const text = `✅ ${cfg.botName || BOT_NAME} connected successfully.\nRuntime: ${runtime()}\nOwner: +${ownerNumber}`;
