@@ -810,12 +810,12 @@ ${toggles.join('\n')}
     await ensureBotGroupAdmin(ctx, 'approve join requests');
     let targets = jidsFromArgs(ctx);
     const wantsAll = ctx.commandName === 'approveall' || !targets.length || /^(all)$/i.test(ctx.args[0] || '');
-    if (wantsAll && typeof ctx.sock.g === 'function') {
-      const pending = await ctx.sock.g(ctx.chatId).catch(() => []);
+    if (wantsAll && typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu === 'function') {
+      const pending = await ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu(ctx.chatId).catch(() => []);
       targets = (pending || []).map(p => p.jid || p.id).filter(Boolean);
     }
     if (!targets.length) return reply(ctx, 'No pending requests found. You can also mention a user or type their number.');
-    if (typeof ctx.sock.g !== 'function') {
+    if (typeof ctx.sock.grKaNCgLvMEXxNzMxj2F7FYi1AdRrTo6Nhu !== 'function') {
       return reply(ctx, 'This Baileys version/WhatsApp account does not expose pending request approval on this host.');
     }
     const result = await ctx.sock.gerror code: 522(ctx.chatId, targets, 'approve');
