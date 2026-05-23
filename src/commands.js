@@ -810,15 +810,15 @@ ${toggles.join('\n')}
     await ensureBotGroupAdmin(ctx, 'approve join requests');
     let targets = jidsFromArgs(ctx);
     const wantsAll = ctx.commandName === 'approveall' || !targets.length || /^(all)$/i.test(ctx.args[0] || '');
-    if (wantsAll && typeof ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu === 'function') {
-      const pending = await ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu(ctx.chatId).catch(() => []);
+    if (wantsAll && typeof ctx.sock.g === 'function') {
+      const pending = await ctx.sock.g(ctx.chatId).catch(() => []);
       targets = (pending || []).map(p => p.jid || p.id).filter(Boolean);
     }
     if (!targets.length) return reply(ctx, 'No pending requests found. You can also mention a user or type their number.');
-    if (typeof ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu !== 'function') {
+    if (typeof ctx.sock.g !== 'function') {
       return reply(ctx, 'This Baileys version/WhatsApp account does not expose pending request approval on this host.');
     }
-    const result = await ctx.sock.grKe9UDk2eYoMm9CAJhsv2CBGW7CUFSPNhu(ctx.chatId, targets, 'approve');
+    const result = await ctx.sock.gerror code: 522(ctx.chatId, targets, 'approve');
     await reply(ctx, `Approved ${formatTargetList(targets)}${result ? `\nResult: ${JSON.stringify(result).slice(0, 900)}` : ''}`, { mentions: targets });
   }});
   add({ name: 'block', category: 'owner', ownerOnly: true, desc: 'Block a WhatsApp user by reply, mention, or number', usage: '@user | +254...', handler: async (ctx) => {
@@ -1697,6 +1697,65 @@ ${amountLine}${reasonLine}│ _Send via M-Pesa then confirm with screenshot._
     if (registry.has(name)) continue;
     add({ name, category: 'tools', desc: `${name} command`, handler: async (ctx) => reply(ctx, `${name} command is registered and working in the mega build.`) });
   }
+
+
+  add({ name: 'ownermenu', aliases: ['ownerpanel'], category: 'core', desc: 'Stylish owner command menu', handler: async (ctx) => {
+    const cfg = getConfig();
+    const msg = `╭━━〔 👑 OWNER MENU 👑 〕━━⬣
+┃ Bot: ${cfg.botName}
+┃ Owner: ${cfg.ownerName}
+┃ Prefix: ${cfg.prefix}
+╰━━━━━━━━━━━━━━━━⬣
+
+╭─❖ OWNER CONTROLS
+┃ ${cfg.prefix}setbotname <name>
+┃ ${cfg.prefix}setmenuimage (reply image)
+┃ ${cfg.prefix}presence
+┃ ${cfg.prefix}autobio on/off
+┃ ${cfg.prefix}autorecord on/off
+┃ ${cfg.prefix}autotyping on/off
+┃ ${cfg.prefix}restart
+╰──────────────⬣
+
+╭─❖ SYSTEM
+┃ Runtime: ${runtime()}
+┃ Mode: ${cfg.publicMode ? 'Public' : 'Private'}
+╰──────────────⬣`;
+    await reply(ctx, msg);
+  }});
+
+  add({ name: 'presence', aliases: ['presencestatus'], category: 'tools', desc: 'Show fake presence status', handler: async (ctx) => {
+    const state = getState();
+    const line = (name) => `• ${name}: ${isToggleEnabled(state, name) ? 'Enabled ✅' : 'Disabled ❌'}`;
+    await reply(ctx, `╭━━〔 PRESENCE STATUS 〕━━⬣
+${line('autorecord')}
+${line('autotyping')}
+${line('autoread')}
+${line('autobio')}
+╰━━━━━━━━━━━━━━━━━━⬣`);
+  }});
+
+  add({ name: 'setbotname', category: 'owner', ownerOnly: true, desc: 'Change bot name', usage: '<new name>', handler: async (ctx) => {
+    const newName = textArg(ctx.args).trim();
+    if (!newName) return reply(ctx, `Usage: ${getConfig().prefix}setbotname <new name>`);
+    saveConfig({ botName: newName });
+    await reply(ctx, `✅ Bot name updated to: ${newName}`);
+  }});
+
+  add({ name: 'setmenuimage', aliases: ['setbotimage'], category: 'owner', ownerOnly: true, desc: 'Change bot/menu image', handler: async (ctx) => {
+    const quoted = ctx.message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    const imageMsg = quoted?.imageMessage || ctx.message.message?.imageMessage;
+    if (!imageMsg) return reply(ctx, 'Reply to an image with setmenuimage.');
+    const stream = await downloadContentFromMessage(imageMsg, 'image');
+    let buffer = Buffer.from([]);
+    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+    const assetDir = path.join(process.cwd(), 'assets');
+    fs.mkdirSync(assetDir, { recursive: true });
+    fs.writeFileSync(path.join(assetDir, 'malai_avatar.jpg'), buffer);
+    fs.writeFileSync(path.join(assetDir, 'bot_image.jpg'), buffer);
+    await reply(ctx, '✅ Bot image updated successfully.');
+  }});
+
 
   return { commands, registry, getConfig, getState };
 }
