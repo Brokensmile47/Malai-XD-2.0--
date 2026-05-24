@@ -241,76 +241,18 @@ ${madeByFooter(cfg)}`;
 
 async function updateAutoBioFromCommand(ctx) {
   const cfg = getConfig();
-  // Detect the sender's local timezone from their phone number
-  const senderTz = detectTimeZoneFromNumber(ctx.sender || '');
-  const bio = formatAutoBio(cfg.botName || BOT_NAME, senderTz);
+  // Use the bot's configured timezone (defaults to Africa/Nairobi for Kenya)
+  const tz = cfg.timeZone || process.env.TIME_ZONE || process.env.TZ || 'Africa/Nairobi';
+  const bio = formatAutoBio(cfg.botName || BOT_NAME, tz);
   if (typeof ctx.sock.updateProfileStatus !== 'function') {
     return 'Autobio was enabled, but this Baileys socket does not expose updateProfileStatus on this host.';
   }
   try {
     await ctx.sock.updateProfileStatus(bio);
-    return `Bio updated using your local timezone (${senderTz}): ${bio}`;
+    return `Bio updated (${tz}): ${bio}`;
   } catch (err) {
     return `Autobio was enabled, but updating bio failed: ${err.message || err}`;
   }
-}
-
-function sanitizeFileName(name = 'download') {
-  return String(name).replace(/[\\/:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || 'download';
-}
-
-// Detect user's timezone from their phone number country code
-function detectTimeZoneFromNumber(jid = '') {
-  const num = normalizeNumber(jid) || '';
-  // Map country prefix → IANA timezone (most common)
-  const prefixMap = [
-    ['254', 'Africa/Nairobi'],   // Kenya
-    ['255', 'Africa/Dar_es_Salaam'], // Tanzania
-    ['256', 'Africa/Kampala'],   // Uganda
-    ['250', 'Africa/Kigali'],    // Rwanda
-    ['251', 'Africa/Addis_Ababa'], // Ethiopia
-    ['27', 'Africa/Johannesburg'], // South Africa
-    ['234', 'Africa/Lagos'],     // Nigeria
-    ['233', 'Africa/Accra'],     // Ghana
-    ['221', 'Africa/Dakar'],     // Senegal
-    ['237', 'Africa/Douala'],    // Cameroon
-    ['263', 'Africa/Harare'],    // Zimbabwe
-    ['260', 'Africa/Lusaka'],    // Zambia
-    ['265', 'Africa/Blantyre'],  // Malawi
-    ['258', 'Africa/Maputo'],    // Mozambique
-    ['267', 'Africa/Gaborone'],  // Botswana
-    ['1', 'America/New_York'],   // USA/Canada (ET default)
-    ['44', 'Europe/London'],     // UK
-    ['91', 'Asia/Kolkata'],      // India
-    ['92', 'Asia/Karachi'],      // Pakistan
-    ['971', 'Asia/Dubai'],       // UAE
-    ['966', 'Asia/Riyadh'],      // Saudi Arabia
-    ['880', 'Asia/Dhaka'],       // Bangladesh
-    ['62', 'Asia/Jakarta'],      // Indonesia
-    ['60', 'Asia/Kuala_Lumpur'], // Malaysia
-    ['65', 'Asia/Singapore'],    // Singapore
-    ['61', 'Australia/Sydney'],  // Australia
-    ['64', 'Pacific/Auckland'],  // New Zealand
-    ['49', 'Europe/Berlin'],     // Germany
-    ['33', 'Europe/Paris'],      // France
-    ['39', 'Europe/Rome'],       // Italy
-    ['34', 'Europe/Madrid'],     // Spain
-    ['7', 'Europe/Moscow'],      // Russia
-    ['86', 'Asia/Shanghai'],     // China
-    ['81', 'Asia/Tokyo'],        // Japan
-    ['82', 'Asia/Seoul'],        // South Korea
-    ['55', 'America/Sao_Paulo'], // Brazil
-    ['52', 'America/Mexico_City'], // Mexico
-    ['20', 'Africa/Cairo'],      // Egypt
-    ['212', 'Africa/Casablanca'], // Morocco
-    ['213', 'Africa/Algiers'],   // Algeria
-  ];
-  // Sort by length desc so longer prefixes match first (e.g. 254 before 2)
-  const sorted = prefixMap.sort((a, b) => b[0].length - a[0].length);
-  for (const [prefix, tz] of sorted) {
-    if (num.startsWith(prefix)) return tz;
-  }
-  return process.env.TIME_ZONE || process.env.TZ || 'Africa/Nairobi';
 }
 
 function isHttpUrl(text = '') {
