@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
 import axios from 'axios';
+import { createRequire } from 'module';
 import { execSync, exec as execCb } from 'child_process';
 import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import { DATA_DIR, readJson, writeJson, runtime, systemInfo, normalizeNumber, mentionedJids, quotedParticipant, pickTarget, hashPercent, safeEvalMath, toFancy, randomChoice, groupAdmins } from './utils.js';
@@ -63,7 +64,7 @@ function getConfig() {
     botName: process.env.BOT_NAME || BOT_NAME,
     ownerName: process.env.OWNER_NAME || OWNER_NAME,
     ownerNumber: normalizeNumber(process.env.OWNER_NUMBER || OWNER_NUMBER),
-    timeZone: process.env.TIME_ZONE || process.env.TZ || 'Africa/Nairobi',
+    timeZone: process.env.TIME_ZONE || 'Africa/Nairobi',
     madeBy: process.env.MADE_BY || 'Kimani Samuel'
   };
   return { ...defaults, ...readJson(configPath, {}) };
@@ -1410,21 +1411,33 @@ ${toggles.join('\n')}
     pixel:      'https://en.ephoto360.com/pixel-text-effect-online-generator-178.html',
   };
 
+  // Load mumaker (CJS) via createRequire — Malai-XD is ESM
+  const _require = createRequire(import.meta.url);
+  let mumaker = null;
+  try { mumaker = _require('mumaker'); } catch { mumaker = null; }
+
   async function generateEphotoImage(ephotoUrl, text) {
+    if (mumaker) {
+      const result = await mumaker.ephoto(ephotoUrl, text);
+      if (!result?.image) throw new Error('mumaker returned no image URL');
+      return result.image;
+    }
+    // Fallback scraper if mumaker unavailable
     const pageRes = await axios.get(ephotoUrl, {
       timeout: 20000,
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' }
     });
-    const html = pageRes.data;
-    const tokenMatch = html.match(/name=["'\']token["'\'][^>]*value=["'\']([^\"']+)["'\']/) ||
-                       html.match(/value=["'\']([a-f0-9]{32,})["'\']/) ;
-    const token = tokenMatch?.[1] || '';
+    const html = String(pageRes.data || '');
     const baseOrigin = 'https://en.ephoto360.com';
-    const actionMatch = html.match(/action=["'\']([^\"']*ephoto360[^\"']+)["'\']/) ||
-                        html.match(/data-action=["'\']([^\"']+)["'\']/) ;
-    let submitUrl = actionMatch?.[1] || ephotoUrl;
+    const tokenMatch = html.match(/name=["']_?token["'][^>]*value=["']([^"']{10,})["']/) ||
+                       html.match(/value=["']([a-f0-9]{40,})["']/);
+    const token = tokenMatch?.[1] || '';
+    const actionMatch = html.match(/action=["']([^"']+)["']/) ||
+                        html.match(/["'](\/api\/effect\/\d+[^"']*)["']/);
+    let submitUrl = actionMatch?.[1] || '';
+    if (!submitUrl) throw new Error('Could not find form action on ephoto360 page');
     if (submitUrl.startsWith('/')) submitUrl = baseOrigin + submitUrl;
-    const fieldMatch = html.match(/name=["'\']((texts?\[\]|text|caption|word))["'\']/) ;
+    const fieldMatch = html.match(/name=["'](texts?\[\]|text)["']/i);
     const fieldName = fieldMatch?.[1] || 'texts[]';
     const formData = new URLSearchParams();
     if (token) formData.append('token', token);
@@ -1438,14 +1451,16 @@ ${toggles.join('\n')}
         'Referer': ephotoUrl, 'Origin': baseOrigin
       }
     });
-    const resHtml = typeof postRes.data === 'string' ? postRes.data : JSON.stringify(postRes.data);
-    const imgMatch = resHtml.match(/"(https?:\/\/[^"]*ephoto360[^"]*\.(?:jpg|png|webp)(?:\?[^"]*)?)"/) ||
-                     resHtml.match(/"(https?:\/\/[^"]+\.(?:jpg|png|webp)[^"]*)"/i) ||
-                     resHtml.match(/"image"\s*:\s*"([^"]+)"/) ||
-                     resHtml.match(/"url"\s*:\s*"([^"]+\.(?:jpg|png|webp)[^"]*)"/);
-    if (!imgMatch?.[1]) throw new Error('No image URL in response');
-    return imgMatch[1].replace(/\\\//g, '/');
+    const body = typeof postRes.data === 'string' ? postRes.data : JSON.stringify(postRes.data);
+    let parsed = null;
+    try { parsed = JSON.parse(body); } catch { parsed = postRes.data; }
+    const imgUrl = parsed?.image || parsed?.url || parsed?.data?.image;
+    if (imgUrl && /^https?:\/\//i.test(imgUrl)) return imgUrl;
+    const urlMatch = body.match(/"(https?:\/\/[^"]+\.(?:jpg|png|webp)(?:\?[^"]*)?)"/i);
+    if (urlMatch?.[1]) return urlMatch[1].replace(/\\\//g, '/');
+    throw new Error('No image URL found in ephoto360 response');
   }
+
 
   for (const [name, ephotoUrl] of Object.entries(EPHOTO_MAP)) {
     if (registry.has(name)) continue;
