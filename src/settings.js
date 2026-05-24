@@ -111,7 +111,7 @@ export const STATUS_REACTIONS = [
 ];
 
 
-export function getDateTimeParts(timeZone = process.env.TIME_ZONE || process.env.TZ || 'Africa/Nairobi') {
+export function getDateTimeParts(timeZone = process.env.TIME_ZONE || 'Africa/Nairobi') {
   const now = new Date();
   const date = new Intl.DateTimeFormat('en-GB', {
     timeZone,
@@ -130,7 +130,7 @@ export function getDateTimeParts(timeZone = process.env.TIME_ZONE || process.env
   return { date, time, timeZone };
 }
 
-export function formatAutoBio(botName = BOT_NAME, timeZone = process.env.TIME_ZONE || process.env.TZ || 'Africa/Nairobi') {
+export function formatAutoBio(botName = BOT_NAME, timeZone = process.env.TIME_ZONE || 'Africa/Nairobi') {
   const { date, time } = getDateTimeParts(timeZone);
   return `🤖 ${botName} is active ⏰ ${time} 📅 ${date} 🚀`;
 }
