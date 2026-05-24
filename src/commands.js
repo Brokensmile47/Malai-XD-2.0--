@@ -265,6 +265,17 @@ function isHttpUrl(text = '') {
   }
 }
 
+function sanitizeFileName(name = '') {
+  // Strip characters that are invalid in filenames across all platforms
+  return String(name)
+    .replace(/[\\/:*?"<>|]/g, '')   // windows-invalid chars
+    .replace(/[\x00-\x1f\x7f]/g, '') // control chars
+    .replace(/\.{2,}/g, '.')          // double dots
+    .trim()
+    .slice(0, 200)
+    || 'audio';
+}
+
 async function resolveYouTubeUrl(input) {
   const query = String(input || '').trim();
   if (!query) throw new Error('Give me a YouTube URL or search name.');
@@ -1297,14 +1308,37 @@ ${toggles.join('\n')}
       let videoUrl = '';
       let finalTitle = sanitizeFileName(video.title || 'video');
 
+      // Extract a direct video file URL — avoids data?.url / data?.link which
+      // many APIs set to the YouTube watch page, causing corrupt/failed downloads.
+      function extractVideoUrl(data) {
+        const candidates = [
+          data?.result?.mp4,         data?.result?.downloadUrl,
+          data?.result?.download_url, data?.result?.dl,
+          data?.result?.video,        data?.result?.file,
+          data?.data?.mp4,           data?.data?.downloadUrl,
+          data?.data?.download_url,   data?.data?.dl,
+          data?.data?.video,          data?.data?.file,
+          data?.mp4,                  data?.downloadUrl,
+          data?.downloadURL,          data?.dl,
+          data?.download,             data?.video,
+          data?.file,
+          // Ambiguous — checked last (often the YouTube watch page URL)
+          data?.result?.url, data?.data?.url, data?.url, data?.link,
+        ];
+        for (const c of candidates) {
+          if (typeof c === 'string' && /^https?:\/\//i.test(c) &&
+              !/youtube\.com\/watch|youtu\.be\//i.test(c)) {
+            return c;
+          }
+        }
+        return '';
+      }
+
       for (const api of apiMethods) {
         try {
           const { data } = await axios.get(api.url, { timeout: 30000, headers: HEADERS });
-          const url =
-            data?.result?.mp4 || data?.result?.download_url || data?.result?.dl ||
-            data?.data?.download_url || data?.data?.dl ||
-            data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
-          if (url && /^https?:\/\//i.test(url)) {
+          const url = extractVideoUrl(data);
+          if (url) {
             videoUrl = url;
             const t = data?.result?.title || data?.data?.title || data?.title;
             if (t) finalTitle = sanitizeFileName(t);
