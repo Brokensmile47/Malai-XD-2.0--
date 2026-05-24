@@ -265,17 +265,6 @@ function isHttpUrl(text = '') {
   }
 }
 
-function sanitizeFileName(name = '') {
-  // Strip characters that are invalid in filenames across all platforms
-  return String(name)
-    .replace(/[\\/:*?"<>|]/g, '')   // windows-invalid chars
-    .replace(/[\x00-\x1f\x7f]/g, '') // control chars
-    .replace(/\.{2,}/g, '.')          // double dots
-    .trim()
-    .slice(0, 200)
-    || 'audio';
-}
-
 async function resolveYouTubeUrl(input) {
   const query = String(input || '').trim();
   if (!query) throw new Error('Give me a YouTube URL or search name.');
@@ -1027,18 +1016,232 @@ ${toggles.join('\n')}
     add({ name: metric, category: 'fun', desc: `${metric} percentage`, handler: async (ctx) => { const target = pickTarget(ctx.message, ctx.sender); await reply(ctx, `@${normalizeNumber(target)} ${metric}: ${hashPercent(metric + target)}%`, { mentions: [target] }); } });
   }
 
-  // AI/local creative commands
-  add({ name: 'ai', aliases: ['gpt','gemini','chatgpt'], category: 'ai', desc: 'Ask AI/local helper', usage: '<prompt>', handler: async (ctx) => {
-    const q = textArg(ctx.args);
-    if (!q) return reply(ctx, 'Usage: ai <question>');
-    await reply(ctx, `AI helper received: ${q}\n\nSet OPENAI_API_KEY and extend src/commands.js if you want live model calls. This offline-safe build keeps the bot running without paid keys.`);
-  }});
-  add({ name: 'summarize', aliases: ['summary'], category: 'ai', desc: 'Simple text summary', usage: '<text>', handler: async (ctx) => { const t = textArg(ctx.args); if (!t) return reply(ctx, 'Usage: summarize <long text>'); await reply(ctx, t.split(/[.!?]/).filter(Boolean).slice(0,3).join('. ').trim() + '.'); } });
-  add({ name: 'story', category: 'ai', desc: 'Generate short story', usage: '<topic>', handler: async (ctx) => { const topic = textArg(ctx.args, 'a brave bot'); await reply(ctx, `Once upon a time, ${topic} faced a hard challenge, learned fast, helped the group, and became legendary.`); } });
-  add({ name: 'recipe', category: 'ai', desc: 'Make a quick recipe', usage: '<ingredient>', handler: async (ctx) => { const item = textArg(ctx.args, 'rice'); await reply(ctx, `Quick ${item} recipe:\n1. Prepare ingredients.\n2. Cook with seasoning.\n3. Taste and adjust.\n4. Serve hot.`); } });
-  add({ name: 'teach', category: 'ai', desc: 'Save a learned reply', usage: '<key> = <reply>', handler: async (ctx) => { const raw = textArg(ctx.args); const [key, ...rest] = raw.split('='); if (!key || !rest.length) return reply(ctx, 'Usage: teach hello = Hi there!'); const st = getState(); st.learned[key.trim().toLowerCase()] = rest.join('=').trim(); saveState(st); await reply(ctx, `Learned: ${key.trim()}`); } });
-  add({ name: 'ask', category: 'ai', desc: 'Read learned reply', usage: '<key>', handler: async (ctx) => { const st = getState(); const key = textArg(ctx.args).toLowerCase(); await reply(ctx, st.learned[key] || 'No learned reply found.'); } });
-  add({ name: 'imagine', aliases: ['dalle','flux','sora'], category: 'ai', desc: 'Image prompt helper', usage: '<prompt>', handler: async (ctx) => { const prompt = textArg(ctx.args); if (!prompt) return reply(ctx, 'Usage: imagine neon dragon'); await reply(ctx, `Image prompt saved:\n${prompt}\n\nConnect an image API in this command to generate real images.`); } });
+
+  // ─── AI: Multi-backend with OpenAI → Gemini → free API fallback ────────────
+  const AI_BACKENDS = {
+    openai: async (prompt, sys = 'You are a helpful assistant.') => {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) throw new Error('OPENAI_API_KEY not set');
+      const { data } = await axios.post('https://api.openai.com/v1/chat/completions', {
+        model: 'gpt-3.5-turbo',
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: prompt }],
+        max_tokens: 800, temperature: 0.7
+      }, { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 30000 });
+      return data.choices[0].message.content.trim();
+    },
+    gemini: async (prompt) => {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+      const { data } = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${apiKey}`,
+        { contents: [{ parts: [{ text: prompt }] }] },
+        { timeout: 30000 }
+      );
+      return data.candidates[0].content.parts[0].text.trim();
+    },
+    free: async (prompt) => {
+      // Free fallback APIs (no key required)
+      const apis = [
+        { url: `https://api.dreaded.site/api/ai?text=${encodeURIComponent(prompt)}`, path: ['result','message'] },
+        { url: `https://api.agatz.xyz/api/ai?message=${encodeURIComponent(prompt)}`, path: ['data'] },
+        { url: `https://bk9.fun/ai/gpt4?q=${encodeURIComponent(prompt)}`, path: ['BK9'] },
+      ];
+      for (const api of apis) {
+        try {
+          const { data } = await axios.get(api.url, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+          const ans = api.path.reduce((o, k) => o?.[k], data);
+          if (ans && typeof ans === 'string' && ans.length > 2) return ans.trim();
+        } catch { /* try next */ }
+      }
+      throw new Error('All AI backends unavailable. Add OPENAI_API_KEY or GEMINI_API_KEY to .env for reliable responses.');
+    }
+  };
+
+  async function getAIResponse(prompt, sys) {
+    if (process.env.OPENAI_API_KEY) {
+      try { return await AI_BACKENDS.openai(prompt, sys); } catch (e) { console.warn('[AI] OpenAI failed:', e.message); }
+    }
+    if (process.env.GEMINI_API_KEY) {
+      try { return await AI_BACKENDS.gemini(prompt); } catch (e) { console.warn('[AI] Gemini failed:', e.message); }
+    }
+    return await AI_BACKENDS.free(prompt);
+  }
+
+  async function sendAIReply(ctx, response) {
+    const chunks = response.match(/[\s\S]{1,3800}/g) || [response];
+    for (let i = 0; i < chunks.length; i++) {
+      await reply(ctx, chunks[i]);
+      if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 400));
+    }
+  }
+
+  add({ name: 'ai', aliases: ['ask', 'bot'], category: 'ai', desc: 'Ask AI anything', usage: '<question>',
+    handler: async (ctx) => {
+      const q = textArg(ctx.args);
+      if (!q) return reply(ctx, `Usage: ${getConfig().prefix}ai <your question>\nExample: ${getConfig().prefix}ai explain gravity`);
+      await reply(ctx, `🤖 *Thinking...*`);
+      try { await sendAIReply(ctx, await getAIResponse(q)); }
+      catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'gpt', aliases: ['chatgpt', 'openai'], category: 'ai', desc: 'Ask ChatGPT (requires OPENAI_API_KEY)', usage: '<prompt>',
+    handler: async (ctx) => {
+      const q = textArg(ctx.args);
+      if (!q) return reply(ctx, `Usage: ${getConfig().prefix}gpt <question>`);
+      if (!process.env.OPENAI_API_KEY) return reply(ctx, '❌ OPENAI_API_KEY not set.\n\nAdd to .env:\nOPENAI_API_KEY=sk-...\n\nGet yours at: platform.openai.com');
+      await reply(ctx, `🧠 *GPT Processing...*`);
+      try { await sendAIReply(ctx, await AI_BACKENDS.openai(q)); }
+      catch (e) { await reply(ctx, `❌ GPT Error: ${e.message}`); }
+    }
+  });
+
+  add({ name: 'gemini', aliases: ['bard'], category: 'ai', desc: 'Ask Google Gemini (requires GEMINI_API_KEY)', usage: '<prompt>',
+    handler: async (ctx) => {
+      const q = textArg(ctx.args);
+      if (!q) return reply(ctx, `Usage: ${getConfig().prefix}gemini <question>`);
+      if (!process.env.GEMINI_API_KEY) return reply(ctx, '❌ GEMINI_API_KEY not set.\n\nGet yours at: ai.google.dev\nThen add to .env:\nGEMINI_API_KEY=your-key');
+      await reply(ctx, `✨ *Gemini Processing...*`);
+      try { await sendAIReply(ctx, await AI_BACKENDS.gemini(q)); }
+      catch (e) { await reply(ctx, `❌ Gemini Error: ${e.message}`); }
+    }
+  });
+
+  add({ name: 'explain', aliases: ['eli5', 'simplify'], category: 'ai', desc: 'Explain something in simple terms', usage: '<topic>',
+    handler: async (ctx) => {
+      const topic = textArg(ctx.args);
+      if (!topic) return reply(ctx, `Usage: ${getConfig().prefix}explain quantum physics`);
+      await reply(ctx, `📖 *Explaining:* ${topic}...`);
+      try {
+        const res = await getAIResponse(`Explain "${topic}" in simple terms a 10-year-old can understand. Use analogies and everyday examples.`);
+        await sendAIReply(ctx, res);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'translate', aliases: ['trans', 'trt'], category: 'ai', desc: 'Translate text to another language', usage: '<language>|<text>',
+    handler: async (ctx) => {
+      const raw = textArg(ctx.args);
+      const [lang, ...rest] = raw.split('|');
+      const text = rest.join('|').trim();
+      if (!lang || !text) return reply(ctx, `Usage: ${getConfig().prefix}translate Spanish|Hello world\nOR: ${getConfig().prefix}translate French|Good morning`);
+      await reply(ctx, `🌍 *Translating to ${lang.trim()}...*`);
+      try {
+        const res = await getAIResponse(`Translate the following to ${lang.trim()}. Reply with the translation only:\n\n"${text}"`);
+        await reply(ctx, `✅ *${lang.trim()} Translation:*\n\n${res}`);
+      } catch (e) { await reply(ctx, `❌ Translation failed: ${e.message}`); }
+    }
+  });
+
+  add({ name: 'code', aliases: ['codegen', 'program'], category: 'ai', desc: 'Get coding help from AI', usage: '<language>|<question>',
+    handler: async (ctx) => {
+      const raw = textArg(ctx.args);
+      const [lang, ...rest] = raw.split('|');
+      const question = rest.join('|').trim();
+      if (!lang || !question) return reply(ctx, `Usage: ${getConfig().prefix}code JavaScript|How to reverse an array?\nOR: ${getConfig().prefix}code Python|Read a file`);
+      await reply(ctx, `💻 *${lang.trim()} Help...*`);
+      try {
+        const res = await getAIResponse(`You are a ${lang.trim()} expert. Answer this:\n\n${question}\n\nInclude code examples.`,
+          `You are an expert ${lang.trim()} programmer. Give clear, concise, working code examples.`);
+        await sendAIReply(ctx, res);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'summarize', aliases: ['summary', 'tldr'], category: 'ai', desc: 'Summarize long text', usage: '<text>',
+    handler: async (ctx) => {
+      const text = textArg(ctx.args);
+      if (!text || text.length < 20) return reply(ctx, `Usage: ${getConfig().prefix}summarize <paste long text here>`);
+      await reply(ctx, `📋 *Summarizing...*`);
+      try {
+        const res = await getAIResponse(`Summarize in 3-5 bullet points:\n\n${text}`);
+        await reply(ctx, `✅ *Summary:*\n\n${res}`);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'story', aliases: ['creative', 'write'], category: 'ai', desc: 'Generate a short creative story', usage: '<topic>',
+    handler: async (ctx) => {
+      const topic = textArg(ctx.args);
+      if (!topic) return reply(ctx, `Usage: ${getConfig().prefix}story a robot learning to paint`);
+      await reply(ctx, `✍️ *Writing story about:* ${topic}...`);
+      try {
+        const res = await getAIResponse(`Write a creative short story (200-300 words) about: ${topic}`);
+        await sendAIReply(ctx, res);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'quiz', aliases: ['trivia', 'question'], category: 'ai', desc: 'Generate a quiz question on any topic', usage: '<topic>',
+    handler: async (ctx) => {
+      const topic = textArg(ctx.args);
+      if (!topic) return reply(ctx, `Usage: ${getConfig().prefix}quiz history`);
+      await reply(ctx, `❓ *Generating ${topic} quiz...*`);
+      try {
+        const res = await getAIResponse(`Create a multiple-choice quiz question about ${topic}.\n\nFormat:\nQuestion: ...\nA) ...\nB) ...\nC) ...\nD) ...\nAnswer: ...`);
+        await reply(ctx, `📝 *${topic.toUpperCase()} Quiz:*\n\n${res}`);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'advice', aliases: ['suggest', 'helpme'], category: 'ai', desc: 'Get AI advice on any situation', usage: '<situation>',
+    handler: async (ctx) => {
+      const situation = textArg(ctx.args);
+      if (!situation) return reply(ctx, `Usage: ${getConfig().prefix}advice I can't decide between two jobs`);
+      await reply(ctx, `💭 *Thinking about your situation...*`);
+      try {
+        const res = await getAIResponse(`Give thoughtful, balanced advice for:\n\n${situation}\n\nConsider multiple perspectives.`);
+        await sendAIReply(ctx, res);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'imagine', aliases: ['dalle', 'flux'], category: 'ai', desc: 'Refine a prompt for AI image generators', usage: '<description>',
+    handler: async (ctx) => {
+      const desc = textArg(ctx.args);
+      if (!desc) return reply(ctx, `Usage: ${getConfig().prefix}imagine a sunset over Mount Kenya`);
+      await reply(ctx, `🎨 *Refining image prompt...*`);
+      try {
+        const res = await getAIResponse(`Refine this into a detailed, artistic prompt for DALL-E or Midjourney:\n\n"${desc}"\n\nMake it vivid and specific.`);
+        await reply(ctx, `🖼️ *Image Prompt Ready:*\n\n${res}\n\n_Use on DALL-E, Midjourney, or Stable Diffusion_`);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'recipe', category: 'ai', desc: 'Get a recipe from AI', usage: '<ingredient or dish name>',
+    handler: async (ctx) => {
+      const item = textArg(ctx.args);
+      if (!item) return reply(ctx, `Usage: ${getConfig().prefix}recipe ugali`);
+      await reply(ctx, `🍳 *Fetching recipe for:* ${item}...`);
+      try {
+        const res = await getAIResponse(`Give a simple, easy-to-follow recipe for: ${item}. Include ingredients and steps.`);
+        await sendAIReply(ctx, res);
+      } catch (e) { await reply(ctx, `❌ ${e.message}`); }
+    }
+  });
+
+  add({ name: 'teach', category: 'ai', desc: 'Teach the bot a custom reply', usage: '<keyword> = <response>',
+    handler: async (ctx) => {
+      const raw = textArg(ctx.args);
+      const [key, ...rest] = raw.split('=');
+      if (!key || !rest.length) return reply(ctx, `Usage: ${getConfig().prefix}teach hello = Hi there!`);
+      const st = getState();
+      st.learned[key.trim().toLowerCase()] = rest.join('=').trim();
+      saveState(st);
+      await reply(ctx, `✅ Learned: *${key.trim()}*`);
+    }
+  });
+
+  add({ name: 'ask', category: 'ai', desc: 'Check a learned reply', usage: '<keyword>',
+    handler: async (ctx) => {
+      const key = textArg(ctx.args).toLowerCase();
+      if (!key) return reply(ctx, `Usage: ${getConfig().prefix}ask hello`);
+      const st = getState();
+      await reply(ctx, st.learned[key] || `No learned reply for *${key}*. Use ${getConfig().prefix}teach ${key} = your reply`);
+    }
+  });
+
+
 
   // Search/download/media commands: reliable wrappers with graceful external failure.
   add({ name: 'github', aliases: ['gh'], category: 'search', desc: 'Search GitHub user', usage: '<username>', handler: async (ctx) => {
@@ -1142,41 +1345,17 @@ ${toggles.join('\n')}
           'Accept': 'application/json, */*'
         };
 
-        // Multi-API fallback chain
+        // Multi-API fallback chain (Knightbot-MD approach)
         const apiMethods = [
-          { name: 'keith',      url: `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}` },
-          { name: 'ElitePro',   url: `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3` },
-          { name: 'Yupra',      url: `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}` },
-          { name: 'Okatsu',     url: `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}` },
+          { name: ' keith', url: `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}` },
+          { name: 'EliteProTech', url: `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3` },
+          { name: 'Yupra', url: `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}` },
+          { name: 'Okatsu', url: `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}` },
           { name: 'davidcyril', url: `https://api.davidcyriltech.my.id/download/ytmp3?url=${encoded}` },
-          { name: 'dreaded',    url: `https://api.dreaded.site/api/ytdl/audio?url=${encoded}` },
-          { name: 'bk9',        url: `https://bk9.fun/download/ytmp3?url=${encoded}` },
-          { name: 'agatz',      url: `https://api.agatz.xyz/api/ytmp3?url=${encoded}` }
+          { name: 'dreaded', url: `https://api.dreaded.site/api/ytdl/audio?url=${encoded}` },
+          { name: 'bk9', url: `https://bk9.fun/download/ytmp3?url=${encoded}` },
+          { name: 'agatz', url: `https://api.agatz.xyz/api/ytmp3?url=${encoded}` }
         ];
-
-        // Extract a direct audio file URL from an API response.
-        // Deliberately avoids data?.url / data?.link which many APIs set to the
-        // original YouTube watch page, causing corrupt downloads.
-        function extractAudioUrl(data) {
-          const candidates = [
-            data?.result?.downloadUrl, data?.result?.download_url, data?.result?.dl,
-            data?.result?.audio,       data?.result?.file,
-            data?.data?.downloadUrl,   data?.data?.download_url,  data?.data?.dl,
-            data?.data?.audio,         data?.data?.file,
-            data?.downloadUrl,         data?.downloadURL,
-            data?.dl,                  data?.download,
-            data?.audio,               data?.file,
-            // These two are ambiguous (often the YouTube page URL) — checked last
-            data?.result?.url, data?.data?.url, data?.url, data?.link,
-          ];
-          for (const c of candidates) {
-            if (typeof c === 'string' && /^https?:\/\//i.test(c) &&
-                !/youtube\.com\/watch|youtu\.be\//i.test(c)) {
-              return c;
-            }
-          }
-          return '';
-        }
 
         let audioUrl = '';
         let finalTitle = sanitizeFileName(video.title || 'song');
@@ -1184,8 +1363,11 @@ ${toggles.join('\n')}
         for (const api of apiMethods) {
           try {
             const { data } = await axios.get(api.url, { timeout: 30000, headers: HEADERS });
-            const url = extractAudioUrl(data);
-            if (url) {
+            const url =
+              data?.result?.downloadUrl || data?.result?.download_url || data?.result?.dl ||
+              data?.data?.download_url || data?.data?.dl ||
+              data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
+            if (url && /^https?:\/\//i.test(url)) {
               audioUrl = url;
               const t = data?.result?.title || data?.data?.title || data?.title;
               if (t) finalTitle = sanitizeFileName(t);
@@ -1194,9 +1376,9 @@ ${toggles.join('\n')}
           } catch { /* try next */ }
         }
 
-        if (!audioUrl) throw new Error('All download APIs failed. Please try again later or send a direct YouTube link.');
+        if (!audioUrl) throw new Error('All download APIs failed. Please try again later or try a direct YouTube link.');
 
-        // Download audio buffer
+        // Download audio buffer and detect format (Knightbot-MD style)
         let audioBuffer;
         try {
           const resp = await axios.get(audioUrl, {
@@ -1225,34 +1407,14 @@ ${toggles.join('\n')}
 
         if (!audioBuffer || audioBuffer.length === 0) throw new Error('Downloaded audio buffer is empty.');
 
-        // Guard: reject HTML error pages, JSON error bodies, or suspiciously tiny buffers
-        // Real MP3s are always > 10 KB and never start with an HTML/JSON error response.
-        const sniff = audioBuffer.slice(0, 256).toString('utf8');
-        if (audioBuffer.length < 10000 ||
-            /^\s*(<\s*!DOCTYPE|<\s*html)/i.test(sniff) ||
-            /^\s*\{[^}]*"error"/i.test(sniff)) {
-          throw new Error('API returned invalid data (not an audio file). Try a different song or send a direct YouTube link.');
-        }
-
         // Detect actual file format from magic bytes
-        const sig  = audioBuffer.slice(0, 12);
-        const hex3 = sig.slice(0, 3).toString('hex');   // ID3 tag
-        const hex2 = sig.slice(0, 2).toString('hex');   // frame sync
-        const a0_4 = sig.slice(0, 4).toString('ascii');
-        const a4_8 = sig.slice(4, 8).toString('ascii');
+        const sig = audioBuffer.slice(0, 12);
+        const ascii4 = sig.slice(4, 8).toString('ascii');
         let mimetype = 'audio/mpeg';
-        let ext = 'mp3';
-        if (hex3 === '494433' || hex2 === 'fff3' || hex2 === 'ffe3' || hex2 === 'fffa' || hex2 === 'fffb') {
-          // ID3v2 header or MPEG frame sync → real MP3
-          mimetype = 'audio/mpeg'; ext = 'mp3';
-        } else if (a4_8 === 'ftyp') {
-          mimetype = 'audio/mp4'; ext = 'm4a';
-        } else if (a0_4 === 'OggS') {
-          mimetype = 'audio/ogg; codecs=opus'; ext = 'ogg';
-        } else if (a0_4 === 'RIFF') {
-          mimetype = 'audio/wav'; ext = 'wav';
-        }
-        const fileName = `${finalTitle.slice(0, 60)}.${ext}`;
+        let fileName = `${finalTitle.slice(0, 60)}.mp3`;
+        if (ascii4 === 'ftyp') { mimetype = 'audio/mp4'; fileName = `${finalTitle.slice(0, 60)}.m4a`; }
+        else if (sig.toString('ascii', 0, 4) === 'OggS') { mimetype = 'audio/ogg; codecs=opus'; fileName = `${finalTitle.slice(0, 60)}.ogg`; }
+        else if (sig.toString('ascii', 0, 4) === 'RIFF') { mimetype = 'audio/wav'; fileName = `${finalTitle.slice(0, 60)}.wav`; }
 
         await ctx.sock.sendMessage(ctx.chatId, {
           audio: audioBuffer,
@@ -1308,37 +1470,14 @@ ${toggles.join('\n')}
       let videoUrl = '';
       let finalTitle = sanitizeFileName(video.title || 'video');
 
-      // Extract a direct video file URL — avoids data?.url / data?.link which
-      // many APIs set to the YouTube watch page, causing corrupt/failed downloads.
-      function extractVideoUrl(data) {
-        const candidates = [
-          data?.result?.mp4,         data?.result?.downloadUrl,
-          data?.result?.download_url, data?.result?.dl,
-          data?.result?.video,        data?.result?.file,
-          data?.data?.mp4,           data?.data?.downloadUrl,
-          data?.data?.download_url,   data?.data?.dl,
-          data?.data?.video,          data?.data?.file,
-          data?.mp4,                  data?.downloadUrl,
-          data?.downloadURL,          data?.dl,
-          data?.download,             data?.video,
-          data?.file,
-          // Ambiguous — checked last (often the YouTube watch page URL)
-          data?.result?.url, data?.data?.url, data?.url, data?.link,
-        ];
-        for (const c of candidates) {
-          if (typeof c === 'string' && /^https?:\/\//i.test(c) &&
-              !/youtube\.com\/watch|youtu\.be\//i.test(c)) {
-            return c;
-          }
-        }
-        return '';
-      }
-
       for (const api of apiMethods) {
         try {
           const { data } = await axios.get(api.url, { timeout: 30000, headers: HEADERS });
-          const url = extractVideoUrl(data);
-          if (url) {
+          const url =
+            data?.result?.mp4 || data?.result?.download_url || data?.result?.dl ||
+            data?.data?.download_url || data?.data?.dl ||
+            data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
+          if (url && /^https?:\/\//i.test(url)) {
             videoUrl = url;
             const t = data?.result?.title || data?.data?.title || data?.title;
             if (t) finalTitle = sanitizeFileName(t);
@@ -1370,11 +1509,320 @@ ${toggles.join('\n')}
     catch (err) { await reply(ctx, `YouTube download failed: ${err.message || err}`); }
   }});
 
-  const downloadNames = ['tiktok','tt','tiktokaudio','instagram','insta','ig','igs','igsc','facebook','fb','twitter','twdl','spotify','pinterest','pin','wallpaper','img','gif','lyrics','xvideo','savestatus','statussave'];
-  for (const name of downloadNames) {
-    if (registry.has(name)) continue;
-    add({ name, category: 'downloads', desc: `${name} downloader/search command`, usage: '<url/query>', handler: async (ctx) => { const q = textArg(ctx.args); await reply(ctx, q ? `${name} received: ${q}\nDownloader hook is ready; connect your preferred API in src/commands.js.` : `Usage: ${getConfig().prefix}${name} <url or query>`); } });
-  }
+  // ─── TIKTOK DOWNLOADER ────────────────────────────────────────────────────
+  add({ name: 'tiktok', aliases: ['tt'], category: 'downloads', desc: 'Download TikTok video (no watermark)', usage: '<TikTok URL>', handler: async (ctx) => {
+    const url = textArg(ctx.args);
+    if (!url) return reply(ctx, `Usage: ${getConfig().prefix}tiktok <TikTok URL>`);
+    if (!/tiktok\.com|vm\.tiktok/i.test(url)) return reply(ctx, '❌ Please provide a valid TikTok URL.');
+    await reply(ctx, '⏳ Downloading TikTok video...');
+    const encoded = encodeURIComponent(url);
+    const apis = [
+      `https://api.tiklydown.eu.org/api/download?url=${encoded}`,
+      `https://tikwm.com/api/?url=${encoded}&hd=1`,
+      `https://api.davidcyriltech.my.id/tiktok?url=${encoded}`,
+      `https://api.dreaded.site/api/tiktok?url=${encoded}`,
+      `https://bk9.fun/download/tiktok?url=${encoded}`,
+    ];
+    let videoUrl = '', title = '';
+    for (const api of apis) {
+      try {
+        const { data } = await axios.get(api, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const vUrl = data?.data?.play || data?.data?.video || data?.video?.noWatermark || data?.result?.video || data?.url || data?.download?.video || data?.nwm_video_url_HQ || data?.nwm_video_url;
+        if (vUrl && /^https?:\/\//i.test(vUrl)) { videoUrl = vUrl; title = data?.data?.title || data?.result?.title || data?.title || ''; break; }
+      } catch { /* try next */ }
+    }
+    if (!videoUrl) return reply(ctx, '❌ Could not download TikTok video. The link may be invalid or private.');
+    try {
+      await ctx.sock.sendMessage(ctx.chatId, {
+        video: { url: videoUrl }, mimetype: 'video/mp4',
+        caption: `🎵 ${title || 'TikTok Video'}\n\n_${getConfig().botName}_`
+      }, { quoted: ctx.message });
+    } catch { await reply(ctx, `✅ Download ready: ${videoUrl}`); }
+  }});
+
+  add({ name: 'tiktokaudio', aliases: ['ttaudio', 'ttsong'], category: 'downloads', desc: 'Download TikTok audio/sound', usage: '<TikTok URL>', handler: async (ctx) => {
+    const url = textArg(ctx.args);
+    if (!url) return reply(ctx, `Usage: ${getConfig().prefix}tiktokaudio <TikTok URL>`);
+    await reply(ctx, '⏳ Extracting TikTok audio...');
+    const encoded = encodeURIComponent(url);
+    const apis = [
+      `https://api.tiklydown.eu.org/api/download?url=${encoded}`,
+      `https://tikwm.com/api/?url=${encoded}`,
+      `https://api.davidcyriltech.my.id/tiktok?url=${encoded}`,
+    ];
+    let audioUrl = '', title = '';
+    for (const api of apis) {
+      try {
+        const { data } = await axios.get(api, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const aUrl = data?.data?.music || data?.result?.music || data?.music || data?.audio;
+        if (aUrl && /^https?:\/\//i.test(aUrl)) { audioUrl = aUrl; title = data?.data?.title || data?.result?.title || ''; break; }
+      } catch { /* try next */ }
+    }
+    if (!audioUrl) return reply(ctx, '❌ Could not extract TikTok audio. Try a different link.');
+    await ctx.sock.sendMessage(ctx.chatId, {
+      audio: { url: audioUrl }, mimetype: 'audio/mpeg', fileName: `${(title || 'tiktok').slice(0,50)}.mp3`, ptt: false
+    }, { quoted: ctx.message });
+  }});
+
+  // ─── INSTAGRAM DOWNLOADER ─────────────────────────────────────────────────
+  add({ name: 'instagram', aliases: ['ig', 'insta'], category: 'downloads', desc: 'Download Instagram post/reel/story', usage: '<Instagram URL>', handler: async (ctx) => {
+    const url = textArg(ctx.args);
+    if (!url) return reply(ctx, `Usage: ${getConfig().prefix}ig <Instagram URL>`);
+    if (!/instagram\.com/i.test(url)) return reply(ctx, '❌ Please provide a valid Instagram URL.');
+    await reply(ctx, '⏳ Downloading Instagram content...');
+    const encoded = encodeURIComponent(url);
+    const apis = [
+      `https://api.davidcyriltech.my.id/instagram?url=${encoded}`,
+      `https://api.dreaded.site/api/igdl?url=${encoded}`,
+      `https://bk9.fun/download/instagram?url=${encoded}`,
+      `https://api.agatz.xyz/api/instagram?url=${encoded}`,
+    ];
+    let mediaUrl = '', isVideo = false;
+    for (const api of apis) {
+      try {
+        const { data } = await axios.get(api, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const items = data?.result?.media || data?.data?.media || data?.result || (Array.isArray(data?.data) ? data.data : null);
+        const first = Array.isArray(items) ? items[0] : items;
+        const mUrl = first?.url || first?.link || data?.url || data?.link || data?.video || data?.image;
+        if (mUrl && /^https?:\/\//i.test(mUrl)) {
+          mediaUrl = mUrl;
+          isVideo = /\.mp4/i.test(mUrl) || first?.type === 'video' || data?.type === 'video';
+          break;
+        }
+      } catch { /* try next */ }
+    }
+    if (!mediaUrl) return reply(ctx, '❌ Could not download Instagram content. Make sure the account is public.');
+    if (isVideo) {
+      await ctx.sock.sendMessage(ctx.chatId, {
+        video: { url: mediaUrl }, mimetype: 'video/mp4', caption: `📸 Instagram\n\n_${getConfig().botName}_`
+      }, { quoted: ctx.message });
+    } else {
+      await ctx.sock.sendMessage(ctx.chatId, {
+        image: { url: mediaUrl }, caption: `📸 Instagram\n\n_${getConfig().botName}_`
+      }, { quoted: ctx.message });
+    }
+  }});
+
+  add({ name: 'igs', aliases: ['igsc', 'igstory'], category: 'downloads', desc: 'Download Instagram story', usage: '<Instagram story URL>', handler: async (ctx) => {
+    const url = textArg(ctx.args);
+    if (!url) return reply(ctx, `Usage: ${getConfig().prefix}igs <Instagram story URL>`);
+    await reply(ctx, '⏳ Downloading Instagram story...');
+    const encoded = encodeURIComponent(url);
+    try {
+      const { data } = await axios.get(`https://api.davidcyriltech.my.id/instagram?url=${encoded}`, { timeout: 20000 });
+      const mUrl = data?.result?.media?.[0]?.url || data?.data?.media?.[0]?.url || data?.url;
+      if (!mUrl) return reply(ctx, '❌ Could not download story. Ensure it\'s a valid public story link.');
+      await ctx.sock.sendMessage(ctx.chatId, {
+        video: { url: mUrl }, mimetype: 'video/mp4', caption: `📸 Instagram Story\n\n_${getConfig().botName}_`
+      }, { quoted: ctx.message });
+    } catch (err) { await reply(ctx, `❌ Story download failed: ${err.message}`); }
+  }});
+
+  // ─── FACEBOOK DOWNLOADER ──────────────────────────────────────────────────
+  add({ name: 'facebook', aliases: ['fb'], category: 'downloads', desc: 'Download Facebook video', usage: '<Facebook URL>', handler: async (ctx) => {
+    const url = textArg(ctx.args);
+    if (!url) return reply(ctx, `Usage: ${getConfig().prefix}facebook <Facebook video URL>`);
+    if (!/facebook\.com|fb\.watch/i.test(url)) return reply(ctx, '❌ Please provide a valid Facebook URL.');
+    await reply(ctx, '⏳ Downloading Facebook video...');
+    const encoded = encodeURIComponent(url);
+    const apis = [
+      `https://api.davidcyriltech.my.id/facebook?url=${encoded}`,
+      `https://api.dreaded.site/api/fbdl?url=${encoded}`,
+      `https://bk9.fun/download/facebook?url=${encoded}`,
+    ];
+    let videoUrl = '', title = '';
+    for (const api of apis) {
+      try {
+        const { data } = await axios.get(api, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const vUrl = data?.result?.hd || data?.result?.sd || data?.result?.url || data?.data?.hd || data?.data?.sd || data?.data?.url || data?.url || data?.hd || data?.sd;
+        if (vUrl && /^https?:\/\//i.test(vUrl)) { videoUrl = vUrl; title = data?.result?.title || data?.data?.title || data?.title || ''; break; }
+      } catch { /* try next */ }
+    }
+    if (!videoUrl) return reply(ctx, '❌ Could not download Facebook video. Ensure the video is public.');
+    await ctx.sock.sendMessage(ctx.chatId, {
+      video: { url: videoUrl }, mimetype: 'video/mp4',
+      caption: `📘 ${title || 'Facebook Video'}\n\n_${getConfig().botName}_`
+    }, { quoted: ctx.message });
+  }});
+
+  // ─── TWITTER/X DOWNLOADER ─────────────────────────────────────────────────
+  add({ name: 'twitter', aliases: ['twdl', 'xdl'], category: 'downloads', desc: 'Download Twitter/X video', usage: '<Tweet URL>', handler: async (ctx) => {
+    const url = textArg(ctx.args);
+    if (!url) return reply(ctx, `Usage: ${getConfig().prefix}twitter <Tweet URL>`);
+    if (!/twitter\.com|x\.com|t\.co/i.test(url)) return reply(ctx, '❌ Please provide a valid Twitter/X URL.');
+    await reply(ctx, '⏳ Downloading Twitter/X video...');
+    const encoded = encodeURIComponent(url);
+    const apis = [
+      `https://api.davidcyriltech.my.id/twitter?url=${encoded}`,
+      `https://api.dreaded.site/api/twitter?url=${encoded}`,
+      `https://bk9.fun/download/twitter?url=${encoded}`,
+      `https://api.agatz.xyz/api/twitter?url=${encoded}`,
+    ];
+    let videoUrl = '';
+    for (const api of apis) {
+      try {
+        const { data } = await axios.get(api, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const vUrl = data?.result?.hd || data?.result?.sd || data?.result?.url || data?.data?.hd || data?.data?.url || data?.url;
+        if (vUrl && /^https?:\/\//i.test(vUrl)) { videoUrl = vUrl; break; }
+      } catch { /* try next */ }
+    }
+    if (!videoUrl) return reply(ctx, '❌ Could not download Twitter/X video. The tweet may be private or have no video.');
+    await ctx.sock.sendMessage(ctx.chatId, {
+      video: { url: videoUrl }, mimetype: 'video/mp4',
+      caption: `🐦 Twitter/X Video\n\n_${getConfig().botName}_`
+    }, { quoted: ctx.message });
+  }});
+
+  // ─── SPOTIFY DOWNLOADER ───────────────────────────────────────────────────
+  add({ name: 'spotify', aliases: ['sp', 'spotifydl'], category: 'downloads', desc: 'Download Spotify track as MP3', usage: '<Spotify URL or song name>', handler: async (ctx) => {
+    const query = textArg(ctx.args);
+    if (!query) return reply(ctx, `Usage: ${getConfig().prefix}spotify <Spotify link or song name>`);
+    await reply(ctx, '⏳ Fetching Spotify track...');
+    const encoded = encodeURIComponent(query);
+    const apis = [
+      `https://api.davidcyriltech.my.id/spotify?url=${encoded}`,
+      `https://bk9.fun/download/spotify?url=${encoded}`,
+      `https://api.dreaded.site/api/spotify?url=${encoded}`,
+      `https://api.agatz.xyz/api/spotify?url=${encoded}`,
+    ];
+    let audioUrl = '', title = '', artist = '';
+    for (const api of apis) {
+      try {
+        const { data } = await axios.get(api, { timeout: 25000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const aUrl = data?.result?.download || data?.result?.url || data?.data?.download || data?.data?.url || data?.url || data?.download;
+        if (aUrl && /^https?:\/\//i.test(aUrl)) {
+          audioUrl = aUrl;
+          title = data?.result?.title || data?.data?.title || data?.title || query;
+          artist = data?.result?.artist || data?.data?.artist || data?.artist || '';
+          break;
+        }
+      } catch { /* try next */ }
+    }
+    if (!audioUrl) return reply(ctx, '❌ Could not download Spotify track. Try a direct Spotify link.');
+    await ctx.sock.sendMessage(ctx.chatId, {
+      audio: { url: audioUrl }, mimetype: 'audio/mpeg',
+      fileName: `${(title || 'spotify').slice(0, 50)}.mp3`, ptt: false
+    }, { quoted: ctx.message });
+    if (title) await reply(ctx, `🎵 *${title}*${artist ? `\n👤 ${artist}` : ''}\n\n_${getConfig().botName}_`);
+  }});
+
+  // ─── PINTEREST DOWNLOADER ─────────────────────────────────────────────────
+  add({ name: 'pinterest', aliases: ['pin', 'pindl'], category: 'downloads', desc: 'Download Pinterest image/video or search', usage: '<Pinterest URL or search query>', handler: async (ctx) => {
+    const query = textArg(ctx.args);
+    if (!query) return reply(ctx, `Usage: ${getConfig().prefix}pinterest <Pinterest URL or search term>`);
+    await reply(ctx, '⏳ Fetching Pinterest content...');
+    const encoded = encodeURIComponent(query);
+    const isPinUrl = /pinterest\.com|pin\.it/i.test(query);
+    try {
+      let mediaUrl = '';
+      if (isPinUrl) {
+        const apis = [
+          `https://api.davidcyriltech.my.id/pinterest?url=${encoded}`,
+          `https://bk9.fun/download/pinterest?url=${encoded}`,
+          `https://api.agatz.xyz/api/pinterest?url=${encoded}`,
+        ];
+        for (const api of apis) {
+          try {
+            const { data } = await axios.get(api, { timeout: 20000 });
+            const mUrl = data?.result?.url || data?.result?.image || data?.data?.url || data?.url || data?.image;
+            if (mUrl && /^https?:\/\//i.test(mUrl)) { mediaUrl = mUrl; break; }
+          } catch { /* try next */ }
+        }
+      } else {
+        // Search Pinterest
+        const { data } = await axios.get(`https://api.agatz.xyz/api/pinterest?url=${encoded}`, { timeout: 20000 });
+        mediaUrl = data?.result?.[0]?.url || data?.data?.[0]?.url || data?.url;
+      }
+      if (!mediaUrl) return reply(ctx, '❌ Could not fetch Pinterest content. Try a direct pin URL.');
+      const isVideo = /\.mp4|\.mov/i.test(mediaUrl);
+      if (isVideo) {
+        await ctx.sock.sendMessage(ctx.chatId, { video: { url: mediaUrl }, mimetype: 'video/mp4', caption: `📌 Pinterest\n\n_${getConfig().botName}_` }, { quoted: ctx.message });
+      } else {
+        await ctx.sock.sendMessage(ctx.chatId, { image: { url: mediaUrl }, caption: `📌 Pinterest\n\n_${getConfig().botName}_` }, { quoted: ctx.message });
+      }
+    } catch (err) { await reply(ctx, `❌ Pinterest failed: ${err.message}`); }
+  }});
+
+  // ─── WALLPAPER & IMAGE SEARCH ─────────────────────────────────────────────
+  add({ name: 'wallpaper', aliases: ['wall', 'wallpaper4k'], category: 'downloads', desc: 'Search and send a wallpaper', usage: '<search term>', handler: async (ctx) => {
+    const query = textArg(ctx.args);
+    if (!query) return reply(ctx, `Usage: ${getConfig().prefix}wallpaper <search term>`);
+    await reply(ctx, '⏳ Searching wallpapers...');
+    try {
+      const { data } = await axios.get(`https://api.agatz.xyz/api/wallpaper?message=${encodeURIComponent(query)}`, { timeout: 15000 });
+      const results = data?.data || data?.result || [];
+      const img = Array.isArray(results) ? results[0]?.url || results[0] : data?.url;
+      if (!img) return reply(ctx, '❌ No wallpapers found for that query.');
+      await ctx.sock.sendMessage(ctx.chatId, { image: { url: img }, caption: `🖼️ Wallpaper: *${query}*\n\n_${getConfig().botName}_` }, { quoted: ctx.message });
+    } catch (err) { await reply(ctx, `❌ Wallpaper search failed: ${err.message}`); }
+  }});
+
+  add({ name: 'img', aliases: ['image', 'imgsearch'], category: 'downloads', desc: 'Search and send an image', usage: '<search term>', handler: async (ctx) => {
+    const query = textArg(ctx.args);
+    if (!query) return reply(ctx, `Usage: ${getConfig().prefix}img <search term>`);
+    await reply(ctx, `⏳ Searching images for *${query}*...`);
+    try {
+      const { data } = await axios.get(`https://api.dreaded.site/api/image?query=${encodeURIComponent(query)}`, { timeout: 15000 });
+      const imgUrl = data?.result?.image || data?.data?.image || data?.image || data?.url;
+      if (!imgUrl) return reply(ctx, '❌ No images found. Try different keywords.');
+      await ctx.sock.sendMessage(ctx.chatId, { image: { url: imgUrl }, caption: `🔍 *${query}*\n\n_${getConfig().botName}_` }, { quoted: ctx.message });
+    } catch (err) { await reply(ctx, `❌ Image search failed: ${err.message}`); }
+  }});
+
+  add({ name: 'gif', aliases: ['gifsearch'], category: 'downloads', desc: 'Search and send a GIF', usage: '<search term>', handler: async (ctx) => {
+    const query = textArg(ctx.args);
+    if (!query) return reply(ctx, `Usage: ${getConfig().prefix}gif <search term>`);
+    await reply(ctx, `⏳ Searching GIFs for *${query}*...`);
+    try {
+      const { data } = await axios.get(`https://api.agatz.xyz/api/gif?message=${encodeURIComponent(query)}`, { timeout: 15000 });
+      const gifUrl = data?.data?.[0]?.url || data?.result?.[0]?.url || data?.url;
+      if (!gifUrl) return reply(ctx, '❌ No GIFs found. Try different keywords.');
+      await ctx.sock.sendMessage(ctx.chatId, { video: { url: gifUrl }, mimetype: 'video/mp4', gifPlayback: true, caption: `🎬 *${query}*\n\n_${getConfig().botName}_` }, { quoted: ctx.message });
+    } catch (err) { await reply(ctx, `❌ GIF search failed: ${err.message}`); }
+  }});
+
+  add({ name: 'lyrics', aliases: ['lyric', 'songlyrics'], category: 'downloads', desc: 'Get song lyrics', usage: '<song name>', handler: async (ctx) => {
+    const query = textArg(ctx.args);
+    if (!query) return reply(ctx, `Usage: ${getConfig().prefix}lyrics <song name>`);
+    await reply(ctx, `⏳ Searching lyrics for *${query}*...`);
+    try {
+      const { data } = await axios.get(`https://api.dreaded.site/api/lyrics?query=${encodeURIComponent(query)}`, { timeout: 15000 });
+      const title = data?.result?.title || data?.title || query;
+      const artist = data?.result?.artist || data?.artist || '';
+      const lyrics = data?.result?.lyrics || data?.lyrics || '';
+      if (!lyrics) return reply(ctx, '❌ Lyrics not found for that song.');
+      const msg = `🎵 *${title}*${artist ? `\n👤 ${artist}` : ''}\n\n${lyrics.slice(0, 3000)}${lyrics.length > 3000 ? '\n...' : ''}\n\n_${getConfig().botName}_`;
+      await reply(ctx, msg);
+    } catch (err) { await reply(ctx, `❌ Lyrics search failed: ${err.message}`); }
+  }});
+
+  add({ name: 'savestatus', aliases: ['statussave', 'dlstatus'], category: 'downloads', desc: 'Save a WhatsApp status — reply to it', handler: async (ctx) => {
+    const quoted = ctx.message?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    if (!quoted) return reply(ctx, `❌ Reply to a status/message with ${getConfig().prefix}savestatus to save it.`);
+    const imgMsg = quoted?.imageMessage;
+    const vidMsg = quoted?.videoMessage;
+    try {
+      if (imgMsg) {
+        const stream = await downloadContentFromMessage(imgMsg, 'image');
+        const chunks = []; for await (const c of stream) chunks.push(c);
+        const buf = Buffer.concat(chunks);
+        await ctx.sock.sendMessage(ctx.chatId, { image: buf, caption: `📥 Status saved!\n\n_${getConfig().botName}_` }, { quoted: ctx.message });
+      } else if (vidMsg) {
+        const stream = await downloadContentFromMessage(vidMsg, 'video');
+        const chunks = []; for await (const c of stream) chunks.push(c);
+        const buf = Buffer.concat(chunks);
+        await ctx.sock.sendMessage(ctx.chatId, { video: buf, mimetype: 'video/mp4', caption: `📥 Status saved!\n\n_${getConfig().botName}_` }, { quoted: ctx.message });
+      } else {
+        await reply(ctx, '❌ Reply to an image or video status to save it.');
+      }
+    } catch (err) { await reply(ctx, `❌ Could not save status: ${err.message}`); }
+  }});
+
+  add({ name: 'xvideo', aliases: ['xvideo2'], category: 'downloads', desc: 'Search and download xvideos (18+, owner only)', ownerOnly: true, usage: '<search query>', handler: async (ctx) => {
+    await reply(ctx, '❌ Adult content download is disabled on this bot.');
+  }});
+
+
 
   // ─── VCF: Export Group Contacts ───────────────────────────────────────────
   add({ name: 'vcf', aliases: ['groupvcf', 'contacts', 'getcontacts'], category: 'group', groupOnly: true, desc: 'Export all group member contacts as a VCF file', handler: async (ctx) => {
@@ -1563,85 +2011,18 @@ ${toggles.join('\n')}
     });
   }
 
-  // All remaining textmaker styles mapped to real ephoto360 URLs
-  const EPHOTO_MAP_EXTRA = {
-    '1917style':      'https://en.ephoto360.com/1917-style-text-effect-523.html',
-    royaltext:        'https://en.ephoto360.com/royal-3d-gold-text-effect-online-626.html',
-    topography:       'https://en.ephoto360.com/topographic-map-text-effect-online-806.html',
-    typography:       'https://en.ephoto360.com/create-3d-colorful-paint-text-effect-online-801.html',
-    watercolortext:   'https://en.ephoto360.com/watercolor-painting-text-effect-online-810.html',
-    writetext:        'https://en.ephoto360.com/write-text-on-christmas-card-online-free-632.html',
-    summerbeach:      'https://en.ephoto360.com/summer-text-effect-online-575.html',
-    lionlogo:         'https://en.ephoto360.com/create-lion-logo-free-online-709.html',
-    wolf:             'https://en.ephoto360.com/create-wolf-logo-online-free-710.html',
-    dragon:           'https://en.ephoto360.com/create-dragon-logo-online-free-711.html',
-    bearlogo:         'https://en.ephoto360.com/create-bear-logo-online-free-712.html',
-    '3dstone':        'https://en.ephoto360.com/create-stone-3d-text-effect-online-free-750.html',
-    '3dtext':         'https://en.ephoto360.com/create-3d-text-logo-free-online-695.html',
-    galaxy2:          'https://en.ephoto360.com/galaxy-text-effect-online-399.html',
-    silver:           'https://en.ephoto360.com/silver-text-effect-online-90.html',
-    steel:            'https://en.ephoto360.com/metallic-steel-text-effect-online-808.html',
-    lava:             'https://en.ephoto360.com/create-lava-magma-text-effect-online-685.html',
-    joker:            'https://en.ephoto360.com/create-joker-text-effect-online-689.html',
-    pornhub:          'https://en.ephoto360.com/pornhub-logo-text-effect-online-generator-510.html',
-    marvel:           'https://en.ephoto360.com/marvel-text-effect-online-generator-528.html',
-    avengers:         'https://en.ephoto360.com/avengers-logo-text-effect-online-generator-527.html',
-    graffiti2:        'https://en.ephoto360.com/create-graffiti-text-effect-online-free-151.html',
-    cloud:            'https://en.ephoto360.com/cloud-text-effect-online-804.html',
-    clouds:           'https://en.ephoto360.com/cloud-text-effect-online-804.html',
-    candy:            'https://en.ephoto360.com/candy-text-effect-online-generator-555.html',
-    sketch:           'https://en.ephoto360.com/sketch-text-effect-online-generator-free-179.html',
-    pencil:           'https://en.ephoto360.com/pencil-text-effect-online-109.html',
-    underwater:       'https://en.ephoto360.com/underwater-text-effect-online-106.html',
-    gradient:         'https://en.ephoto360.com/gradient-text-effect-online-807.html',
-    luxury:           'https://en.ephoto360.com/luxury-golden-text-effect-online-805.html',
-    business:         'https://en.ephoto360.com/business-card-text-effect-online-809.html',
-    signature:        'https://en.ephoto360.com/create-handwritten-signature-text-online-630.html',
-    logomaker:        'https://en.ephoto360.com/gaming-logo-maker-online-free-660.html',
-    gaminglogo:       'https://en.ephoto360.com/gaming-logo-maker-online-free-660.html',
-    naruto:           'https://en.ephoto360.com/naruto-text-effect-online-534.html',
-    animebanner:      'https://en.ephoto360.com/anime-banner-text-effect-online-765.html',
-    spacebanner:      'https://en.ephoto360.com/space-text-effect-online-811.html',
-    matrixcode:       'https://en.ephoto360.com/matrix-text-effect-154.html',
-    neonlight:        'https://en.ephoto360.com/create-colorful-neon-light-text-effects-online-797.html',
-    neondevil:        'https://en.ephoto360.com/neon-devil-wings-text-effect-online-683.html',
-    glow:             'https://en.ephoto360.com/create-glow-text-effect-online-658.html',
-    glowing:          'https://en.ephoto360.com/create-glow-text-effect-online-658.html',
-    bluefire:         'https://en.ephoto360.com/blue-fire-text-effect-online-686.html',
-    greenfire:        'https://en.ephoto360.com/green-fire-text-effect-online-687.html',
-    flame:            'https://en.ephoto360.com/flame-lettering-effect-372.html',
-    leaf:             'https://en.ephoto360.com/green-brush-text-effect-typography-maker-online-153.html',
-    beach:            'https://en.ephoto360.com/write-on-the-beach-sand-online-free-587.html',
-    sunset:           'https://en.ephoto360.com/sunset-text-effect-online-812.html',
-  };
-
-  for (const [name, ephotoUrl] of Object.entries(EPHOTO_MAP_EXTRA)) {
+  const remainingTextMakers = ['1917style','royaltext','topography','typography','watercolortext','writetext','summerbeach','lionlogo','wolf','dragon','bearlogo','3dstone','3dtext','galaxy2','silver','steel','lava','joker','pornhub','marvel','avengers','graffiti2','cloud','clouds','candy','sketch','pencil','underwater','gradient','luxury','business','signature','logomaker','gaminglogo','naruto','animebanner','spacebanner','matrixcode','neonlight','neondevil','glow','glowing','bluefire','greenfire','flame','leaf','beach','sunset'];
+  for (const name of remainingTextMakers) {
     if (registry.has(name)) continue;
-    add({
-      name,
-      category: 'textmaker',
-      desc: `Generate ${name} styled text image`,
-      usage: '<your text>',
-      handler: async (ctx) => {
-        const text = textArg(ctx.args);
-        if (!text) return reply(ctx, `Usage: ${getConfig().prefix}${name} Your Text\nExample: ${getConfig().prefix}${name} Malai Bot`);
-        await reply(ctx, `⏳ Generating *${name}* text style...`);
-        try {
-          const imageUrl = await generateEphotoImage(ephotoUrl, text);
-          await ctx.sock.sendMessage(ctx.chatId, {
-            image: { url: imageUrl },
-            caption: `✨ *${name.toUpperCase()}* style\n_"${text}"_\n\n_Powered by ${getConfig().botName}_`
-          }, { quoted: ctx.message });
-        } catch (err) {
-          console.error(`[textmaker:${name}]`, err.message);
-          await reply(ctx, `❌ Failed to generate *${name}* image. Try again.\n_${err.message.slice(0,100)}_`);
-        }
-      }
-    });
+    add({ name, category: 'textmaker', desc: `${name} text style`, usage: '<text>', handler: async (ctx) => {
+      const t = textArg(ctx.args);
+      if (!t) return reply(ctx, `Usage: ${getConfig().prefix}${name} Your Text`);
+      await reply(ctx, `╭─〔 ✨ *${name.toUpperCase()}* 〕\n│ ${toFancy(t, ['bold','italic','mono','double','circle'][hashPercent(name,4)])}\n╰────────────`);
+    }});
   }
 
   // ─── ANIME: Real GIF fetching (ported from Knightbot-MD) ──────────────────
-  const ANIMU_BASE_URL = 'https://api.some-random-api.com/anime';
+  const ANIMU_BASE_URL = 'https://api.some-random-api.com/animu';
   const ANIME_MESSAGES = {
     kiss:      (f,t) => `💋 *${f}* kisses *${t}*! 😘`,
     hug:       (f,t) => `🤗 *${f}* hugs *${t}* tightly! 💕`,
@@ -1670,40 +2051,19 @@ ${toggles.join('\n')}
     jump:      (f,_) => `🦘 *${f}* jumps!`,
   };
 
-  // nekos.best supports: baka,bite,blush,bored,cry,cuddle,dance,facepalm,feed,handhold,
-  // happy,highfive,hug,kick,kiss,laugh,nod,nom,nope,pat,poke,pout,punch,run,sad,shoot,
-  // shrug,slap,sleep,smile,smug,stare,think,thumbsup,tickle,wave,wink,yawn,yeet
-  const NEKOS_BEST_TYPES = new Set(['baka','bite','blush','bored','cry','cuddle','dance','facepalm','feed','handhold','happy','highfive','hug','kick','kiss','laugh','nod','nom','nope','pat','poke','pout','punch','run','sad','shoot','shrug','slap','sleep','smile','smug','stare','think','thumbsup','tickle','wave','wink','yawn','yeet']);
-
-  async function fetchNekosBestGif(type) {
-    const t = type === 'face-palm' ? 'facepalm' : type;
-    if (!NEKOS_BEST_TYPES.has(t)) return null;
-    const res = await axios.get(`https://nekos.best/api/v2/${t}`, { timeout: 15000 });
-    const results = res.data?.results;
-    if (Array.isArray(results) && results.length > 0) return results[0].url || null;
-    return null;
-  }
-
   async function fetchAnimuGif(type) {
-    // some-random-api endpoint: /anime/<type> (not /animu/)
-    const sraTypeMap = { facepalm: 'face-palm', 'face-palm': 'face-palm' };
-    const sraType = sraTypeMap[type] || type;
-    const sraValidTypes = ['nom','poke','cry','kiss','pat','hug','wink','face-palm','quote','slap','bite','cuddle','blush','wave','dance','happy','sad','angry','run','jump'];
-    if (!sraValidTypes.includes(sraType)) return null;
-    const res = await axios.get(`${ANIMU_BASE_URL}/${sraType}`, {
-      timeout: 15000,
-      headers: { 'User-Agent': 'Mozilla/5.0 Malai-XD-2.0' }
-    });
+    const apiTypeMap = { facepalm: 'face-palm' };
+    const apiType = apiTypeMap[type] || type;
+    const validTypes = ['nom','poke','cry','kiss','pat','hug','wink','face-palm','quote'];
+    if (!validTypes.includes(apiType)) return null;
+    const res = await axios.get(`${ANIMU_BASE_URL}/${apiType}`, { timeout: 15000 });
     return res.data?.link || res.data?.gif || res.data?.url || null;
   }
 
   async function fetchWaifuPicsGif(type) {
     const sfwTypes = ['wink','pat','hug','poke','slap','kiss','blush','smile','wave','highfive','happy','dance','run','bite','cuddle','feed','kill','cry','nom','yeet','jump'];
     if (!sfwTypes.includes(type)) return null;
-    const res = await axios.get(`https://api.waifu.pics/sfw/${type}`, {
-      timeout: 15000,
-      headers: { 'User-Agent': 'Mozilla/5.0 Malai-XD-2.0' }
-    });
+    const res = await axios.get(`https://api.waifu.pics/sfw/${type}`, { timeout: 15000 });
     return res.data?.url || null;
   }
 
@@ -1723,20 +2083,11 @@ ${toggles.join('\n')}
         const caption = (ANIME_MESSAGES[name] || ((f,t) => `*${f}* → *${t}*`))(senderName, targetName);
         try {
           let gifUrl = null;
-          // 1st: nekos.best (most reliable, always returns gif/mp4)
-          try { gifUrl = await fetchNekosBestGif(name); } catch {}
-          // 2nd: waifu.pics
+          try { gifUrl = await fetchAnimuGif(name); } catch {}
           if (!gifUrl) { try { gifUrl = await fetchWaifuPicsGif(name); } catch {} }
-          // 3rd: some-random-api
-          if (!gifUrl) { try { gifUrl = await fetchAnimuGif(name); } catch {} }
           if (gifUrl) {
-            // nekos.best returns .gif URLs - send as video with gifPlayback for WhatsApp animated display
-            const isGifFile = /\.gif(\?|$)/i.test(gifUrl);
             await ctx.sock.sendMessage(ctx.chatId, {
-              video: { url: gifUrl },
-              mimetype: isGifFile ? 'video/mp4' : 'video/mp4',
-              caption,
-              gifPlayback: true
+              video: { url: gifUrl }, mimetype: 'video/mp4', caption, gifPlayback: true
             }, { quoted: ctx.message, mentions: [target] });
           } else {
             await reply(ctx, caption, { mentions: [target] });
@@ -1876,11 +2227,11 @@ ${toggles.join('\n')}
   });
 
   // ─── GETPP: Full profile card (dp, about, name, number, country) ───────────
-  add({ name: 'getpp', aliases: ['dp','profile','whois','userinfo','about'], category: 'utility',
-    desc: 'Get full profile info — display picture, about, name, number, country',
+  add({ name: 'getpp', aliases: ['dp','profile','whois','userinfo'], category: 'utility',
+    desc: 'Get profile picture, number, name, about and country of a user',
     usage: '@user | +254... | (reply to message)',
     handler: async (ctx) => {
-      // Determine target JID
+      // Resolve target JID
       let targetJid = '';
       const mentioned = mentionedJids(ctx.message);
       const quoted = ctx.message.message?.extendedTextMessage?.contextInfo?.participant;
@@ -1893,85 +2244,64 @@ ${toggles.join('\n')}
 
       const num = normalizeNumber(targetJid);
 
-      // Detect country from phone number country code
-      function detectCountry(number = '') {
-        const n = String(number).replace(/\D/g, '');
-        const prefixMap = [
-          [['1'], 'United States/Canada 🇺🇸🇨🇦'],
-          [['254'], 'Kenya 🇰🇪'], [['255'], 'Tanzania 🇹🇿'], [['256'], 'Uganda 🇺🇬'],
-          [['251'], 'Ethiopia 🇪🇹'], [['252'], 'Somalia 🇸🇴'], [['253'], 'Djibouti 🇩🇯'],
-          [['257'], 'Burundi 🇧🇮'], [['258'], 'Mozambique 🇲🇿'], [['260'], 'Zambia 🇿🇲'],
-          [['261'], 'Madagascar 🇲🇬'], [['262'], 'Réunion 🇷🇪'], [['263'], 'Zimbabwe 🇿🇼'],
-          [['264'], 'Namibia 🇳🇦'], [['265'], 'Malawi 🇲🇼'], [['266'], 'Lesotho 🇱🇸'],
-          [['267'], 'Botswana 🇧🇼'], [['268'], 'Eswatini 🇸🇿'], [['269'], 'Comoros 🇰🇲'],
-          [['27'], 'South Africa 🇿🇦'], [['20'], 'Egypt 🇪🇬'], [['212'], 'Morocco 🇲🇦'],
-          [['213'], 'Algeria 🇩🇿'], [['216'], 'Tunisia 🇹🇳'], [['218'], 'Libya 🇱🇾'],
-          [['221'], 'Senegal 🇸🇳'], [['224'], 'Guinea 🇬🇳'], [['225'], 'Ivory Coast 🇨🇮'],
-          [['233'], 'Ghana 🇬🇭'], [['234'], 'Nigeria 🇳🇬'], [['237'], 'Cameroon 🇨🇲'],
-          [['243'], 'DR Congo 🇨🇩'], [['244'], 'Angola 🇦🇴'],
-          [['44'], 'United Kingdom 🇬🇧'], [['33'], 'France 🇫🇷'], [['49'], 'Germany 🇩🇪'],
-          [['39'], 'Italy 🇮🇹'], [['34'], 'Spain 🇪🇸'], [['31'], 'Netherlands 🇳🇱'],
-          [['91'], 'India 🇮🇳'], [['86'], 'China 🇨🇳'], [['81'], 'Japan 🇯🇵'],
-          [['82'], 'South Korea 🇰🇷'], [['92'], 'Pakistan 🇵🇰'], [['880'], 'Bangladesh 🇧🇩'],
-          [['55'], 'Brazil 🇧🇷'], [['52'], 'Mexico 🇲🇽'], [['54'], 'Argentina 🇦🇷'],
-          [['57'], 'Colombia 🇨🇴'], [['61'], 'Australia 🇦🇺'], [['64'], 'New Zealand 🇳🇿'],
-          [['7'], 'Russia 🇷🇺'], [['380'], 'Ukraine 🇺🇦'], [['48'], 'Poland 🇵🇱'],
-          [['971'], 'UAE 🇦🇪'], [['966'], 'Saudi Arabia 🇸🇦'], [['962'], 'Jordan 🇯🇴'],
-          [['98'], 'Iran 🇮🇷'], [['90'], 'Turkey 🇹🇷'], [['60'], 'Malaysia 🇲🇾'],
-          [['62'], 'Indonesia 🇮🇩'], [['63'], 'Philippines 🇵🇭'], [['66'], 'Thailand 🇹🇭'],
-          [['84'], 'Vietnam 🇻🇳'], [['65'], 'Singapore 🇸🇬'],
-        ];
-        for (const [prefixes, country] of prefixMap) {
-          if (prefixes.some(p => n.startsWith(p))) return country;
+      // Detect country from number prefix
+      function detectCountry(n = '') {
+        n = String(n).replace(/\D/g, '');
+        const map = [
+          ['254','Kenya 🇰🇪'],['255','Tanzania 🇹🇿'],['256','Uganda 🇺🇬'],['250','Rwanda 🇷🇼'],
+          ['251','Ethiopia 🇪🇹'],['252','Somalia 🇸🇴'],['257','Burundi 🇧🇮'],['258','Mozambique 🇲🇿'],
+          ['260','Zambia 🇿🇲'],['263','Zimbabwe 🇿🇼'],['264','Namibia 🇳🇦'],['265','Malawi 🇲🇼'],
+          ['266','Lesotho 🇱🇸'],['267','Botswana 🇧🇼'],['268','Eswatini 🇸🇿'],
+          ['27','South Africa 🇿🇦'],['234','Nigeria 🇳🇬'],['233','Ghana 🇬🇭'],
+          ['237','Cameroon 🇨🇲'],['221','Senegal 🇸🇳'],['243','DR Congo 🇨🇩'],
+          ['244','Angola 🇦🇴'],['20','Egypt 🇪🇬'],['212','Morocco 🇲🇦'],
+          ['213','Algeria 🇩🇿'],['216','Tunisia 🇹🇳'],['218','Libya 🇱🇾'],
+          ['44','United Kingdom 🇬🇧'],['33','France 🇫🇷'],['49','Germany 🇩🇪'],
+          ['39','Italy 🇮🇹'],['34','Spain 🇪🇸'],['31','Netherlands 🇳🇱'],
+          ['91','India 🇮🇳'],['92','Pakistan 🇵🇰'],['880','Bangladesh 🇧🇩'],
+          ['86','China 🇨🇳'],['81','Japan 🇯🇵'],['82','South Korea 🇰🇷'],
+          ['971','UAE 🇦🇪'],['966','Saudi Arabia 🇸🇦'],['962','Jordan 🇯🇴'],
+          ['98','Iran 🇮🇷'],['90','Turkey 🇹🇷'],['60','Malaysia 🇲🇾'],
+          ['62','Indonesia 🇮🇩'],['63','Philippines 🇵🇭'],['66','Thailand 🇹🇭'],
+          ['65','Singapore 🇸🇬'],['84','Vietnam 🇻🇳'],['61','Australia 🇦🇺'],
+          ['64','New Zealand 🇳🇿'],['55','Brazil 🇧🇷'],['52','Mexico 🇲🇽'],
+          ['54','Argentina 🇦🇷'],['57','Colombia 🇨🇴'],['7','Russia 🇷🇺'],
+          ['380','Ukraine 🇺🇦'],['48','Poland 🇵🇱'],['1','United States 🇺🇸'],
+        ].sort((a,b) => b[0].length - a[0].length); // longest prefix first
+        for (const [prefix, country] of map) {
+          if (n.startsWith(prefix)) return country;
         }
         return 'Unknown 🌍';
       }
 
-      // Fetch profile picture
-      let ppBuffer = null;
-      let ppUrl = null;
-      try {
-        ppUrl = await ctx.sock.profilePictureUrl(targetJid, 'image');
-        const res = await axios.get(ppUrl, { responseType: 'arraybuffer', timeout: 10000 });
-        ppBuffer = Buffer.from(res.data);
-      } catch { ppUrl = null; }
+      // Fetch all in parallel
+      const [ppResult, statusResult, bizResult] = await Promise.allSettled([
+        (async () => {
+          const url = await ctx.sock.profilePictureUrl(targetJid, 'image');
+          const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 8000 });
+          return Buffer.from(res.data);
+        })(),
+        ctx.sock.fetchStatus(targetJid).catch(() => null),
+        ctx.sock.getBusinessProfile(targetJid).catch(() => null)
+      ]);
 
-      // Fetch status/about
-      let statusText = 'No status set';
-      try {
-        const statusResult = await ctx.sock.fetchStatus(targetJid).catch(() => null);
-        if (statusResult?.status) statusText = statusResult.status;
-      } catch { /* ignore */ }
+      const ppBuffer   = ppResult.status === 'fulfilled'    ? ppResult.value    : null;
+      const statusData = statusResult.status === 'fulfilled' ? statusResult.value : null;
+      const bizData    = bizResult.status === 'fulfilled'   ? bizResult.value   : null;
 
-      // Fetch business profile (WhatsApp display name)
-      let waName = ctx.message?.pushName || '';
-      try {
-        const bp = await ctx.sock.getBusinessProfile(targetJid).catch(() => null);
-        if (bp?.name) waName = bp.name;
-      } catch { /* ignore */ }
-
+      const name    = bizData?.name || ctx.message?.pushName || ctx.pushName || `+${num}`;
+      const about   = statusData?.status || '_No about set_';
       const country = detectCountry(num);
+      const botName = getConfig().botName || BOT_NAME;
 
-      const card = [
-        `╭━━━━━━━━━━━━━━━━━━╮`,
-        `┃   👤 *USER PROFILE*`,
-        `╰━━━━━━━━━━━━━━━━━━╯`,
-        ``,
-        `📱 *WhatsApp Number:*`,
-        `┃ +${num}`,
-        ``,
-        waName ? `🏷️ *Display Name:*\n┃ ${waName}\n` : '',
-        `🌍 *Country:*`,
-        `┃ ${country}`,
-        ``,
-        `📝 *About / Status:*`,
-        `┃ ${statusText}`,
-        ``,
-        ppUrl ? `🖼️ *Profile Picture:* _(sent above)_` : `🖼️ *Profile Picture:* _No DP / private_`,
-        ``,
-        `━━━━━━━━━━━━━━━━━━━━`,
-        `_Powered by ${getConfig().botName || 'Malai-XD'}_`
-      ].filter(Boolean).join('\n');
+      const card =
+`╭━━━〔 👤 *PROFILE* 〕━━━╮
+┃ 📱 *Number:* +${num}
+┃ 🏷️ *Name:* ${name}
+┃ 📝 *About:* ${about}
+┃ 🌍 *Country:* ${country}
+╰━━━━━━━━━━━━━━━━━━━━━╯
+_${botName}_`;
 
       if (ppBuffer) {
         await ctx.sock.sendMessage(ctx.chatId, {
@@ -1980,7 +2310,7 @@ ${toggles.join('\n')}
           mentions: [targetJid]
         }, { quoted: ctx.message });
       } else {
-        await reply(ctx, card, { mentions: [targetJid] });
+        await reply(ctx, card + '\n_🖼️ No profile picture / private_', { mentions: [targetJid] });
       }
     }
   });
