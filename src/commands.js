@@ -1372,19 +1372,239 @@ ${toggles.join('\n')}
     }});
   }
 
-  // Textmaker/ephoto names from the uploaded zips, implemented as styled caption generators.
-  const textMakers = ['1917style','1917','royaltext','topography','typography','watercolortext','writetext','summerbeach','neon','blackpink','devil','fire','glitch','hacker','ice','impressive','leaves','light','matrix','metallic','purple','sand','snow','thunder','arena','lionlogo','wolf','dragon','bearlogo','3dstone','3dtext','galaxy','galaxy2','gold','silver','steel','blood','lava','joker','pornhub','marvel','avengers','graffiti','graffiti2','cloud','clouds','candy','christmas','birthday','halloween','sketch','pencil','water','underwater','rainbow','gradient','luxury','business','signature','logomaker','gaminglogo','naruto','animebanner','spacebanner','matrixcode','cyberpunk','pixel','retro','vintage','neonlight','neondevil','glow','glowing','bluefire','greenfire','flame','smoke','toxic','wood','leaf','beach','summer','sunset'];
-  for (const name of textMakers) {
-    if (registry.has(name)) continue;
-    add({ name, category: 'textmaker', desc: `${name} text style`, usage: '<text>', handler: async (ctx) => { const t = textArg(ctx.args); if (!t) return reply(ctx, `Usage: ${getConfig().prefix}${name} Your Text`); await reply(ctx, `╭─〔 ${name.toUpperCase()} 〕\n│ ${toFancy(t, ['bold','italic','mono','double','circle'][hashPercent(name,4)])}\n╰────────────`); } });
+  // ─── TEXTMAKER: Real ephoto360 image generation (ported from Knightbot-MD) ─
+  const EPHOTO_MAP = {
+    metallic:   'https://en.ephoto360.com/impressive-decorative-3d-metal-text-effect-798.html',
+    ice:        'https://en.ephoto360.com/ice-text-effect-online-101.html',
+    snow:       'https://en.ephoto360.com/create-a-snow-3d-text-effect-free-online-621.html',
+    impressive: 'https://en.ephoto360.com/create-3d-colorful-paint-text-effect-online-801.html',
+    matrix:     'https://en.ephoto360.com/matrix-text-effect-154.html',
+    light:      'https://en.ephoto360.com/light-text-effect-futuristic-technology-style-648.html',
+    neon:       'https://en.ephoto360.com/create-colorful-neon-light-text-effects-online-797.html',
+    devil:      'https://en.ephoto360.com/neon-devil-wings-text-effect-online-683.html',
+    purple:     'https://en.ephoto360.com/purple-text-effect-online-100.html',
+    thunder:    'https://en.ephoto360.com/thunder-text-effect-online-97.html',
+    leaves:     'https://en.ephoto360.com/green-brush-text-effect-typography-maker-online-153.html',
+    '1917':     'https://en.ephoto360.com/1917-style-text-effect-523.html',
+    arena:      'https://en.ephoto360.com/create-cover-arena-of-valor-by-mastering-360.html',
+    hacker:     'https://en.ephoto360.com/create-anonymous-hacker-avatars-cyan-neon-677.html',
+    sand:       'https://en.ephoto360.com/write-names-and-messages-on-the-sand-online-582.html',
+    blackpink:  'https://en.ephoto360.com/create-a-blackpink-style-logo-with-members-signatures-810.html',
+    glitch:     'https://en.ephoto360.com/create-digital-glitch-text-effects-online-767.html',
+    fire:       'https://en.ephoto360.com/flame-lettering-effect-372.html',
+    gold:       'https://en.ephoto360.com/gold-text-effect-online-91.html',
+    galaxy:     'https://en.ephoto360.com/galaxy-text-effect-online-399.html',
+    graffiti:   'https://en.ephoto360.com/graffiti-text-effect-generator-online-free-150.html',
+    rainbow:    'https://en.ephoto360.com/rainbow-text-effect-online-102.html',
+    retro:      'https://en.ephoto360.com/retro-text-effect-online-141.html',
+    vintage:    'https://en.ephoto360.com/vintage-text-effect-online-110.html',
+    halloween:  'https://en.ephoto360.com/create-halloween-text-effects-online-661.html',
+    christmas:  'https://en.ephoto360.com/merry-christmas-text-effect-online-generator-503.html',
+    blood:      'https://en.ephoto360.com/blood-text-effect-online-107.html',
+    wood:       'https://en.ephoto360.com/wood-text-effect-online-108.html',
+    water:      'https://en.ephoto360.com/water-text-effect-online-105.html',
+    smoke:      'https://en.ephoto360.com/smoke-text-effect-online-99.html',
+    toxic:      'https://en.ephoto360.com/neon-text-effect-for-toxic-environment-online-803.html',
+    summer:     'https://en.ephoto360.com/summer-text-effect-online-575.html',
+    cyberpunk:  'https://en.ephoto360.com/cyberpunk-2077-text-effect-online-612.html',
+    pixel:      'https://en.ephoto360.com/pixel-text-effect-online-generator-178.html',
+  };
+
+  async function generateEphotoImage(ephotoUrl, text) {
+    const pageRes = await axios.get(ephotoUrl, {
+      timeout: 20000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' }
+    });
+    const html = pageRes.data;
+    const tokenMatch = html.match(/name=["'\']token["'\'][^>]*value=["'\']([^\"']+)["'\']/) ||
+                       html.match(/value=["'\']([a-f0-9]{32,})["'\']/) ;
+    const token = tokenMatch?.[1] || '';
+    const baseOrigin = 'https://en.ephoto360.com';
+    const actionMatch = html.match(/action=["'\']([^\"']*ephoto360[^\"']+)["'\']/) ||
+                        html.match(/data-action=["'\']([^\"']+)["'\']/) ;
+    let submitUrl = actionMatch?.[1] || ephotoUrl;
+    if (submitUrl.startsWith('/')) submitUrl = baseOrigin + submitUrl;
+    const fieldMatch = html.match(/name=["'\']((texts?\[\]|text|caption|word))["'\']/) ;
+    const fieldName = fieldMatch?.[1] || 'texts[]';
+    const formData = new URLSearchParams();
+    if (token) formData.append('token', token);
+    formData.append(fieldName, text);
+    formData.append('submit', 'GO');
+    const postRes = await axios.post(submitUrl, formData.toString(), {
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': ephotoUrl, 'Origin': baseOrigin
+      }
+    });
+    const resHtml = typeof postRes.data === 'string' ? postRes.data : JSON.stringify(postRes.data);
+    const imgMatch = resHtml.match(/"(https?:\/\/[^"]*ephoto360[^"]*\.(?:jpg|png|webp)(?:\?[^"]*)?)"/) ||
+                     resHtml.match(/"(https?:\/\/[^"]+\.(?:jpg|png|webp)[^"]*)"/i) ||
+                     resHtml.match(/"image"\s*:\s*"([^"]+)"/) ||
+                     resHtml.match(/"url"\s*:\s*"([^"]+\.(?:jpg|png|webp)[^"]*)"/);
+    if (!imgMatch?.[1]) throw new Error('No image URL in response');
+    return imgMatch[1].replace(/\\\//g, '/');
   }
 
-  // Anime/action commands from uploaded bots.
-  const animeNames = ['anime','animu','waifu','neko','loli','megumin','konachan','hentai','hwaifu','hneko','milf','nom','poke','cry','kiss','pat','hug','wink','facepalm','face-palm','animuquote','blush','smile','wave','bite','slap','highfive','dance','kill','cuddle','feed','yeet','happy','sad','angry','confused','bored','sleep','run','jump'];
-  for (const name of animeNames) {
+  for (const [name, ephotoUrl] of Object.entries(EPHOTO_MAP)) {
     if (registry.has(name)) continue;
-    add({ name, category: 'anime', desc: `${name} anime/action command`, handler: async (ctx) => { const target = pickTarget(ctx.message, ctx.sender); await reply(ctx, `*${name}* action for @${normalizeNumber(target)}.`, { mentions: [target] }); } });
+    add({
+      name,
+      aliases: name === '1917' ? ['1917style'] : [],
+      category: 'textmaker',
+      desc: `Generate ${name} styled text image`,
+      usage: '<your text>',
+      handler: async (ctx) => {
+        const text = textArg(ctx.args);
+        if (!text) return reply(ctx, `Usage: ${getConfig().prefix}${name} Your Text\nExample: ${getConfig().prefix}${name} Malai Bot`);
+        await reply(ctx, `⏳ Generating *${name}* text style...`);
+        try {
+          const imageUrl = await generateEphotoImage(ephotoUrl, text);
+          await ctx.sock.sendMessage(ctx.chatId, {
+            image: { url: imageUrl },
+            caption: `✨ *${name.toUpperCase()}* style\n_"${text}"_\n\n_Powered by ${getConfig().botName}_`
+          }, { quoted: ctx.message });
+        } catch (err) {
+          console.error(`[textmaker:${name}]`, err.message);
+          await reply(ctx, `❌ Failed to generate *${name}* image. Try again.\n_${err.message.slice(0,100)}_`);
+        }
+      }
+    });
   }
+
+  const remainingTextMakers = ['1917style','royaltext','topography','typography','watercolortext','writetext','summerbeach','lionlogo','wolf','dragon','bearlogo','3dstone','3dtext','galaxy2','silver','steel','lava','joker','pornhub','marvel','avengers','graffiti2','cloud','clouds','candy','sketch','pencil','underwater','gradient','luxury','business','signature','logomaker','gaminglogo','naruto','animebanner','spacebanner','matrixcode','neonlight','neondevil','glow','glowing','bluefire','greenfire','flame','leaf','beach','sunset'];
+  for (const name of remainingTextMakers) {
+    if (registry.has(name)) continue;
+    add({ name, category: 'textmaker', desc: `${name} text style`, usage: '<text>', handler: async (ctx) => {
+      const t = textArg(ctx.args);
+      if (!t) return reply(ctx, `Usage: ${getConfig().prefix}${name} Your Text`);
+      await reply(ctx, `╭─〔 ✨ *${name.toUpperCase()}* 〕\n│ ${toFancy(t, ['bold','italic','mono','double','circle'][hashPercent(name,4)])}\n╰────────────`);
+    }});
+  }
+
+  // ─── ANIME: Real GIF fetching (ported from Knightbot-MD) ──────────────────
+  const ANIMU_BASE_URL = 'https://api.some-random-api.com/animu';
+  const ANIME_MESSAGES = {
+    kiss:      (f,t) => `💋 *${f}* kisses *${t}*! 😘`,
+    hug:       (f,t) => `🤗 *${f}* hugs *${t}* tightly! 💕`,
+    pat:       (f,t) => `😊 *${f}* pats *${t}* on the head! 🥰`,
+    poke:      (f,t) => `👉 *${f}* pokes *${t}*! 😄`,
+    nom:       (f,t) => `😋 *${f}* noms *${t}*! 🍪`,
+    cry:       (f,_) => `😭 *${f}* is crying! Someone comfort them!`,
+    wink:      (f,t) => `😉 *${f}* winks at *${t}*~`,
+    facepalm:  (f,_) => `🤦 *${f}* face-palms!`,
+    'face-palm':(f,_) => `🤦 *${f}* face-palms!`,
+    slap:      (f,t) => `👋 *${f}* slaps *${t}*! That had to hurt! 💥`,
+    bite:      (f,t) => `😬 *${f}* bites *${t}*! 🦷`,
+    cuddle:    (f,t) => `🥰 *${f}* cuddles with *${t}*!`,
+    highfive:  (f,t) => `✋ *${f}* high-fives *${t}*!`,
+    dance:     (f,_) => `💃 *${f}* is dancing! 🕺`,
+    blush:     (f,t) => `😊 *${f}* blushes at *${t}*~`,
+    wave:      (f,t) => `👋 *${f}* waves at *${t}*!`,
+    kill:      (f,t) => `💀 *${f}* eliminated *${t}*!`,
+    feed:      (f,t) => `🍜 *${f}* feeds *${t}*! 🥄`,
+    yeet:      (f,t) => `🚀 *${f}* yeets *${t}* into the sky!`,
+    happy:     (f,_) => `😄 *${f}* is feeling happy!`,
+    sad:       (f,_) => `😢 *${f}* is feeling sad...`,
+    angry:     (f,_) => `😠 *${f}* is angry! Watch out!`,
+    sleep:     (f,_) => `😴 *${f}* is sleeping... shhh!`,
+    run:       (f,_) => `🏃 *${f}* runs away!`,
+    jump:      (f,_) => `🦘 *${f}* jumps!`,
+  };
+
+  async function fetchAnimuGif(type) {
+    const apiTypeMap = { facepalm: 'face-palm' };
+    const apiType = apiTypeMap[type] || type;
+    const validTypes = ['nom','poke','cry','kiss','pat','hug','wink','face-palm','quote'];
+    if (!validTypes.includes(apiType)) return null;
+    const res = await axios.get(`${ANIMU_BASE_URL}/${apiType}`, { timeout: 15000 });
+    return res.data?.link || res.data?.gif || res.data?.url || null;
+  }
+
+  async function fetchWaifuPicsGif(type) {
+    const sfwTypes = ['wink','pat','hug','poke','slap','kiss','blush','smile','wave','highfive','happy','dance','run','bite','cuddle','feed','kill','cry','nom','yeet','jump'];
+    if (!sfwTypes.includes(type)) return null;
+    const res = await axios.get(`https://api.waifu.pics/sfw/${type}`, { timeout: 15000 });
+    return res.data?.url || null;
+  }
+
+  const interactionCmds = ['kiss','hug','pat','poke','nom','cry','wink','facepalm','face-palm','slap','bite','cuddle','highfive','dance','blush','wave','kill','feed','yeet','happy','sad','angry','sleep','run','jump'];
+  for (const name of interactionCmds) {
+    if (registry.has(name)) continue;
+    add({
+      name,
+      aliases: name === 'face-palm' ? ['facepalm'] : name === 'facepalm' ? ['face-palm'] : [],
+      category: 'anime',
+      desc: `Send a ${name} anime GIF`,
+      usage: '[@user]',
+      handler: async (ctx) => {
+        const target = pickTarget(ctx.message, ctx.sender);
+        const senderName = ctx.pushName || normalizeNumber(ctx.sender) || 'Someone';
+        const targetName = target === ctx.sender ? 'themselves' : `@${normalizeNumber(target)}`;
+        const caption = (ANIME_MESSAGES[name] || ((f,t) => `*${f}* → *${t}*`))(senderName, targetName);
+        try {
+          let gifUrl = null;
+          try { gifUrl = await fetchAnimuGif(name); } catch {}
+          if (!gifUrl) { try { gifUrl = await fetchWaifuPicsGif(name); } catch {} }
+          if (gifUrl) {
+            await ctx.sock.sendMessage(ctx.chatId, {
+              video: { url: gifUrl }, mimetype: 'video/mp4', caption, gifPlayback: true
+            }, { quoted: ctx.message, mentions: [target] });
+          } else {
+            await reply(ctx, caption, { mentions: [target] });
+          }
+        } catch (err) {
+          console.error(`[anime:${name}]`, err.message);
+          await reply(ctx, caption, { mentions: [target] });
+        }
+      }
+    });
+  }
+
+  const imageAnimeCmds = ['waifu','neko','loli','megumin','konachan','animu','anime'];
+  for (const name of imageAnimeCmds) {
+    if (registry.has(name)) continue;
+    add({
+      name, category: 'anime', desc: `Random ${name} anime image`,
+      handler: async (ctx) => {
+        try {
+          let url = null;
+          try {
+            const r = await axios.get(`https://api.waifu.pics/sfw/${name === 'animu' ? 'waifu' : name}`, { timeout: 15000 });
+            url = r.data?.url;
+          } catch {}
+          if (!url) {
+            const r2 = await axios.get(`${ANIMU_BASE_URL}/wink`, { timeout: 15000 });
+            url = r2.data?.link;
+          }
+          if (url) {
+            await ctx.sock.sendMessage(ctx.chatId, {
+              image: { url }, caption: `🎌 *${name.toUpperCase()}*\n_Powered by ${getConfig().botName}_`
+            }, { quoted: ctx.message });
+          } else {
+            await reply(ctx, `❌ Could not fetch ${name} image right now.`);
+          }
+        } catch (err) { await reply(ctx, `❌ Failed: ${err.message}`); }
+      }
+    });
+  }
+
+  if (!registry.has('animuquote')) {
+    add({
+      name: 'animuquote', aliases: ['animequote','aq'], category: 'anime', desc: 'Random anime quote',
+      handler: async (ctx) => {
+        try {
+          const res = await axios.get(`${ANIMU_BASE_URL}/quote`, { timeout: 15000 });
+          const q = res.data?.sentence || res.data?.quote || 'No quote found.';
+          const char = res.data?.character || '';
+          const anime = res.data?.anime || '';
+          await reply(ctx, `💬 *"${q}"*${char ? `\n\n— _${char}_` : ''}${anime ? ` from *${anime}*` : ''}`);
+        } catch { await reply(ctx, '❌ Could not fetch an anime quote right now.'); }
+      }
+    });
+  }
+
 
   // ─── ANTILINK (delete/kick modes) ─────────────────────────────────────────
   add({ name: 'antilink', aliases: ['antilinkoff'], category: 'group', groupOnly: true, adminOnly: true,
