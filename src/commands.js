@@ -1131,17 +1131,41 @@ ${toggles.join('\n')}
           'Accept': 'application/json, */*'
         };
 
-        // Multi-API fallback chain (Knightbot-MD approach)
+        // Multi-API fallback chain
         const apiMethods = [
-          { name: ' keith', url: `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}` },
-          { name: 'EliteProTech', url: `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3` },
-          { name: 'Yupra', url: `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}` },
-          { name: 'Okatsu', url: `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}` },
+          { name: 'keith',      url: `https://apis-keith.vercel.app/download/dlmp3?url=${encoded}` },
+          { name: 'ElitePro',   url: `https://eliteprotech-apis.zone.id/ytdown?url=${encoded}&format=mp3` },
+          { name: 'Yupra',      url: `https://api.yupra.my.id/api/downloader/ytmp3?url=${encoded}` },
+          { name: 'Okatsu',     url: `https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${encoded}` },
           { name: 'davidcyril', url: `https://api.davidcyriltech.my.id/download/ytmp3?url=${encoded}` },
-          { name: 'dreaded', url: `https://api.dreaded.site/api/ytdl/audio?url=${encoded}` },
-          { name: 'bk9', url: `https://bk9.fun/download/ytmp3?url=${encoded}` },
-          { name: 'agatz', url: `https://api.agatz.xyz/api/ytmp3?url=${encoded}` }
+          { name: 'dreaded',    url: `https://api.dreaded.site/api/ytdl/audio?url=${encoded}` },
+          { name: 'bk9',        url: `https://bk9.fun/download/ytmp3?url=${encoded}` },
+          { name: 'agatz',      url: `https://api.agatz.xyz/api/ytmp3?url=${encoded}` }
         ];
+
+        // Extract a direct audio file URL from an API response.
+        // Deliberately avoids data?.url / data?.link which many APIs set to the
+        // original YouTube watch page, causing corrupt downloads.
+        function extractAudioUrl(data) {
+          const candidates = [
+            data?.result?.downloadUrl, data?.result?.download_url, data?.result?.dl,
+            data?.result?.audio,       data?.result?.file,
+            data?.data?.downloadUrl,   data?.data?.download_url,  data?.data?.dl,
+            data?.data?.audio,         data?.data?.file,
+            data?.downloadUrl,         data?.downloadURL,
+            data?.dl,                  data?.download,
+            data?.audio,               data?.file,
+            // These two are ambiguous (often the YouTube page URL) — checked last
+            data?.result?.url, data?.data?.url, data?.url, data?.link,
+          ];
+          for (const c of candidates) {
+            if (typeof c === 'string' && /^https?:\/\//i.test(c) &&
+                !/youtube\.com\/watch|youtu\.be\//i.test(c)) {
+              return c;
+            }
+          }
+          return '';
+        }
 
         let audioUrl = '';
         let finalTitle = sanitizeFileName(video.title || 'song');
@@ -1149,11 +1173,8 @@ ${toggles.join('\n')}
         for (const api of apiMethods) {
           try {
             const { data } = await axios.get(api.url, { timeout: 30000, headers: HEADERS });
-            const url =
-              data?.result?.downloadUrl || data?.result?.download_url || data?.result?.dl ||
-              data?.data?.download_url || data?.data?.dl ||
-              data?.downloadURL || data?.dl || data?.download || data?.url || data?.link;
-            if (url && /^https?:\/\//i.test(url)) {
+            const url = extractAudioUrl(data);
+            if (url) {
               audioUrl = url;
               const t = data?.result?.title || data?.data?.title || data?.title;
               if (t) finalTitle = sanitizeFileName(t);
@@ -1162,9 +1183,9 @@ ${toggles.join('\n')}
           } catch { /* try next */ }
         }
 
-        if (!audioUrl) throw new Error('All download APIs failed. Please try again later or try a direct YouTube link.');
+        if (!audioUrl) throw new Error('All download APIs failed. Please try again later or send a direct YouTube link.');
 
-        // Download audio buffer and detect format (Knightbot-MD style)
+        // Download audio buffer
         let audioBuffer;
         try {
           const resp = await axios.get(audioUrl, {
@@ -1193,14 +1214,34 @@ ${toggles.join('\n')}
 
         if (!audioBuffer || audioBuffer.length === 0) throw new Error('Downloaded audio buffer is empty.');
 
+        // Guard: reject HTML error pages, JSON error bodies, or suspiciously tiny buffers
+        // Real MP3s are always > 10 KB and never start with an HTML/JSON error response.
+        const sniff = audioBuffer.slice(0, 256).toString('utf8');
+        if (audioBuffer.length < 10000 ||
+            /^\s*(<\s*!DOCTYPE|<\s*html)/i.test(sniff) ||
+            /^\s*\{[^}]*"error"/i.test(sniff)) {
+          throw new Error('API returned invalid data (not an audio file). Try a different song or send a direct YouTube link.');
+        }
+
         // Detect actual file format from magic bytes
-        const sig = audioBuffer.slice(0, 12);
-        const ascii4 = sig.slice(4, 8).toString('ascii');
+        const sig  = audioBuffer.slice(0, 12);
+        const hex3 = sig.slice(0, 3).toString('hex');   // ID3 tag
+        const hex2 = sig.slice(0, 2).toString('hex');   // frame sync
+        const a0_4 = sig.slice(0, 4).toString('ascii');
+        const a4_8 = sig.slice(4, 8).toString('ascii');
         let mimetype = 'audio/mpeg';
-        let fileName = `${finalTitle.slice(0, 60)}.mp3`;
-        if (ascii4 === 'ftyp') { mimetype = 'audio/mp4'; fileName = `${finalTitle.slice(0, 60)}.m4a`; }
-        else if (sig.toString('ascii', 0, 4) === 'OggS') { mimetype = 'audio/ogg; codecs=opus'; fileName = `${finalTitle.slice(0, 60)}.ogg`; }
-        else if (sig.toString('ascii', 0, 4) === 'RIFF') { mimetype = 'audio/wav'; fileName = `${finalTitle.slice(0, 60)}.wav`; }
+        let ext = 'mp3';
+        if (hex3 === '494433' || hex2 === 'fff3' || hex2 === 'ffe3' || hex2 === 'fffa' || hex2 === 'fffb') {
+          // ID3v2 header or MPEG frame sync → real MP3
+          mimetype = 'audio/mpeg'; ext = 'mp3';
+        } else if (a4_8 === 'ftyp') {
+          mimetype = 'audio/mp4'; ext = 'm4a';
+        } else if (a0_4 === 'OggS') {
+          mimetype = 'audio/ogg; codecs=opus'; ext = 'ogg';
+        } else if (a0_4 === 'RIFF') {
+          mimetype = 'audio/wav'; ext = 'wav';
+        }
+        const fileName = `${finalTitle.slice(0, 60)}.${ext}`;
 
         await ctx.sock.sendMessage(ctx.chatId, {
           audio: audioBuffer,
@@ -1488,18 +1529,85 @@ ${toggles.join('\n')}
     });
   }
 
-  const remainingTextMakers = ['1917style','royaltext','topography','typography','watercolortext','writetext','summerbeach','lionlogo','wolf','dragon','bearlogo','3dstone','3dtext','galaxy2','silver','steel','lava','joker','pornhub','marvel','avengers','graffiti2','cloud','clouds','candy','sketch','pencil','underwater','gradient','luxury','business','signature','logomaker','gaminglogo','naruto','animebanner','spacebanner','matrixcode','neonlight','neondevil','glow','glowing','bluefire','greenfire','flame','leaf','beach','sunset'];
-  for (const name of remainingTextMakers) {
+  // All remaining textmaker styles mapped to real ephoto360 URLs
+  const EPHOTO_MAP_EXTRA = {
+    '1917style':      'https://en.ephoto360.com/1917-style-text-effect-523.html',
+    royaltext:        'https://en.ephoto360.com/royal-3d-gold-text-effect-online-626.html',
+    topography:       'https://en.ephoto360.com/topographic-map-text-effect-online-806.html',
+    typography:       'https://en.ephoto360.com/create-3d-colorful-paint-text-effect-online-801.html',
+    watercolortext:   'https://en.ephoto360.com/watercolor-painting-text-effect-online-810.html',
+    writetext:        'https://en.ephoto360.com/write-text-on-christmas-card-online-free-632.html',
+    summerbeach:      'https://en.ephoto360.com/summer-text-effect-online-575.html',
+    lionlogo:         'https://en.ephoto360.com/create-lion-logo-free-online-709.html',
+    wolf:             'https://en.ephoto360.com/create-wolf-logo-online-free-710.html',
+    dragon:           'https://en.ephoto360.com/create-dragon-logo-online-free-711.html',
+    bearlogo:         'https://en.ephoto360.com/create-bear-logo-online-free-712.html',
+    '3dstone':        'https://en.ephoto360.com/create-stone-3d-text-effect-online-free-750.html',
+    '3dtext':         'https://en.ephoto360.com/create-3d-text-logo-free-online-695.html',
+    galaxy2:          'https://en.ephoto360.com/galaxy-text-effect-online-399.html',
+    silver:           'https://en.ephoto360.com/silver-text-effect-online-90.html',
+    steel:            'https://en.ephoto360.com/metallic-steel-text-effect-online-808.html',
+    lava:             'https://en.ephoto360.com/create-lava-magma-text-effect-online-685.html',
+    joker:            'https://en.ephoto360.com/create-joker-text-effect-online-689.html',
+    pornhub:          'https://en.ephoto360.com/pornhub-logo-text-effect-online-generator-510.html',
+    marvel:           'https://en.ephoto360.com/marvel-text-effect-online-generator-528.html',
+    avengers:         'https://en.ephoto360.com/avengers-logo-text-effect-online-generator-527.html',
+    graffiti2:        'https://en.ephoto360.com/create-graffiti-text-effect-online-free-151.html',
+    cloud:            'https://en.ephoto360.com/cloud-text-effect-online-804.html',
+    clouds:           'https://en.ephoto360.com/cloud-text-effect-online-804.html',
+    candy:            'https://en.ephoto360.com/candy-text-effect-online-generator-555.html',
+    sketch:           'https://en.ephoto360.com/sketch-text-effect-online-generator-free-179.html',
+    pencil:           'https://en.ephoto360.com/pencil-text-effect-online-109.html',
+    underwater:       'https://en.ephoto360.com/underwater-text-effect-online-106.html',
+    gradient:         'https://en.ephoto360.com/gradient-text-effect-online-807.html',
+    luxury:           'https://en.ephoto360.com/luxury-golden-text-effect-online-805.html',
+    business:         'https://en.ephoto360.com/business-card-text-effect-online-809.html',
+    signature:        'https://en.ephoto360.com/create-handwritten-signature-text-online-630.html',
+    logomaker:        'https://en.ephoto360.com/gaming-logo-maker-online-free-660.html',
+    gaminglogo:       'https://en.ephoto360.com/gaming-logo-maker-online-free-660.html',
+    naruto:           'https://en.ephoto360.com/naruto-text-effect-online-534.html',
+    animebanner:      'https://en.ephoto360.com/anime-banner-text-effect-online-765.html',
+    spacebanner:      'https://en.ephoto360.com/space-text-effect-online-811.html',
+    matrixcode:       'https://en.ephoto360.com/matrix-text-effect-154.html',
+    neonlight:        'https://en.ephoto360.com/create-colorful-neon-light-text-effects-online-797.html',
+    neondevil:        'https://en.ephoto360.com/neon-devil-wings-text-effect-online-683.html',
+    glow:             'https://en.ephoto360.com/create-glow-text-effect-online-658.html',
+    glowing:          'https://en.ephoto360.com/create-glow-text-effect-online-658.html',
+    bluefire:         'https://en.ephoto360.com/blue-fire-text-effect-online-686.html',
+    greenfire:        'https://en.ephoto360.com/green-fire-text-effect-online-687.html',
+    flame:            'https://en.ephoto360.com/flame-lettering-effect-372.html',
+    leaf:             'https://en.ephoto360.com/green-brush-text-effect-typography-maker-online-153.html',
+    beach:            'https://en.ephoto360.com/write-on-the-beach-sand-online-free-587.html',
+    sunset:           'https://en.ephoto360.com/sunset-text-effect-online-812.html',
+  };
+
+  for (const [name, ephotoUrl] of Object.entries(EPHOTO_MAP_EXTRA)) {
     if (registry.has(name)) continue;
-    add({ name, category: 'textmaker', desc: `${name} text style`, usage: '<text>', handler: async (ctx) => {
-      const t = textArg(ctx.args);
-      if (!t) return reply(ctx, `Usage: ${getConfig().prefix}${name} Your Text`);
-      await reply(ctx, `╭─〔 ✨ *${name.toUpperCase()}* 〕\n│ ${toFancy(t, ['bold','italic','mono','double','circle'][hashPercent(name,4)])}\n╰────────────`);
-    }});
+    add({
+      name,
+      category: 'textmaker',
+      desc: `Generate ${name} styled text image`,
+      usage: '<your text>',
+      handler: async (ctx) => {
+        const text = textArg(ctx.args);
+        if (!text) return reply(ctx, `Usage: ${getConfig().prefix}${name} Your Text\nExample: ${getConfig().prefix}${name} Malai Bot`);
+        await reply(ctx, `⏳ Generating *${name}* text style...`);
+        try {
+          const imageUrl = await generateEphotoImage(ephotoUrl, text);
+          await ctx.sock.sendMessage(ctx.chatId, {
+            image: { url: imageUrl },
+            caption: `✨ *${name.toUpperCase()}* style\n_"${text}"_\n\n_Powered by ${getConfig().botName}_`
+          }, { quoted: ctx.message });
+        } catch (err) {
+          console.error(`[textmaker:${name}]`, err.message);
+          await reply(ctx, `❌ Failed to generate *${name}* image. Try again.\n_${err.message.slice(0,100)}_`);
+        }
+      }
+    });
   }
 
   // ─── ANIME: Real GIF fetching (ported from Knightbot-MD) ──────────────────
-  const ANIMU_BASE_URL = 'https://api.some-random-api.com/animu';
+  const ANIMU_BASE_URL = 'https://api.some-random-api.com/anime';
   const ANIME_MESSAGES = {
     kiss:      (f,t) => `💋 *${f}* kisses *${t}*! 😘`,
     hug:       (f,t) => `🤗 *${f}* hugs *${t}* tightly! 💕`,
@@ -1528,19 +1636,40 @@ ${toggles.join('\n')}
     jump:      (f,_) => `🦘 *${f}* jumps!`,
   };
 
+  // nekos.best supports: baka,bite,blush,bored,cry,cuddle,dance,facepalm,feed,handhold,
+  // happy,highfive,hug,kick,kiss,laugh,nod,nom,nope,pat,poke,pout,punch,run,sad,shoot,
+  // shrug,slap,sleep,smile,smug,stare,think,thumbsup,tickle,wave,wink,yawn,yeet
+  const NEKOS_BEST_TYPES = new Set(['baka','bite','blush','bored','cry','cuddle','dance','facepalm','feed','handhold','happy','highfive','hug','kick','kiss','laugh','nod','nom','nope','pat','poke','pout','punch','run','sad','shoot','shrug','slap','sleep','smile','smug','stare','think','thumbsup','tickle','wave','wink','yawn','yeet']);
+
+  async function fetchNekosBestGif(type) {
+    const t = type === 'face-palm' ? 'facepalm' : type;
+    if (!NEKOS_BEST_TYPES.has(t)) return null;
+    const res = await axios.get(`https://nekos.best/api/v2/${t}`, { timeout: 15000 });
+    const results = res.data?.results;
+    if (Array.isArray(results) && results.length > 0) return results[0].url || null;
+    return null;
+  }
+
   async function fetchAnimuGif(type) {
-    const apiTypeMap = { facepalm: 'face-palm' };
-    const apiType = apiTypeMap[type] || type;
-    const validTypes = ['nom','poke','cry','kiss','pat','hug','wink','face-palm','quote'];
-    if (!validTypes.includes(apiType)) return null;
-    const res = await axios.get(`${ANIMU_BASE_URL}/${apiType}`, { timeout: 15000 });
+    // some-random-api endpoint: /anime/<type> (not /animu/)
+    const sraTypeMap = { facepalm: 'face-palm', 'face-palm': 'face-palm' };
+    const sraType = sraTypeMap[type] || type;
+    const sraValidTypes = ['nom','poke','cry','kiss','pat','hug','wink','face-palm','quote','slap','bite','cuddle','blush','wave','dance','happy','sad','angry','run','jump'];
+    if (!sraValidTypes.includes(sraType)) return null;
+    const res = await axios.get(`${ANIMU_BASE_URL}/${sraType}`, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0 Malai-XD-2.0' }
+    });
     return res.data?.link || res.data?.gif || res.data?.url || null;
   }
 
   async function fetchWaifuPicsGif(type) {
     const sfwTypes = ['wink','pat','hug','poke','slap','kiss','blush','smile','wave','highfive','happy','dance','run','bite','cuddle','feed','kill','cry','nom','yeet','jump'];
     if (!sfwTypes.includes(type)) return null;
-    const res = await axios.get(`https://api.waifu.pics/sfw/${type}`, { timeout: 15000 });
+    const res = await axios.get(`https://api.waifu.pics/sfw/${type}`, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0 Malai-XD-2.0' }
+    });
     return res.data?.url || null;
   }
 
@@ -1560,11 +1689,20 @@ ${toggles.join('\n')}
         const caption = (ANIME_MESSAGES[name] || ((f,t) => `*${f}* → *${t}*`))(senderName, targetName);
         try {
           let gifUrl = null;
-          try { gifUrl = await fetchAnimuGif(name); } catch {}
+          // 1st: nekos.best (most reliable, always returns gif/mp4)
+          try { gifUrl = await fetchNekosBestGif(name); } catch {}
+          // 2nd: waifu.pics
           if (!gifUrl) { try { gifUrl = await fetchWaifuPicsGif(name); } catch {} }
+          // 3rd: some-random-api
+          if (!gifUrl) { try { gifUrl = await fetchAnimuGif(name); } catch {} }
           if (gifUrl) {
+            // nekos.best returns .gif URLs - send as video with gifPlayback for WhatsApp animated display
+            const isGifFile = /\.gif(\?|$)/i.test(gifUrl);
             await ctx.sock.sendMessage(ctx.chatId, {
-              video: { url: gifUrl }, mimetype: 'video/mp4', caption, gifPlayback: true
+              video: { url: gifUrl },
+              mimetype: isGifFile ? 'video/mp4' : 'video/mp4',
+              caption,
+              gifPlayback: true
             }, { quoted: ctx.message, mentions: [target] });
           } else {
             await reply(ctx, caption, { mentions: [target] });
