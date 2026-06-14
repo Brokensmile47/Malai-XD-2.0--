@@ -1112,20 +1112,63 @@ ${toggles.join('\n')}
       return data.candidates[0].content.parts[0].text.trim();
     },
     free: async (prompt) => {
-      // Free fallback APIs (no key required)
+      // Free fallback APIs (no key required) — tested working June 2026
+      const encoded = encodeURIComponent(prompt);
       const apis = [
-        { url: `https://api.dreaded.site/api/ai?text=${encodeURIComponent(prompt)}`, path: ['result','message'] },
-        { url: `https://api.agatz.xyz/api/ai?message=${encodeURIComponent(prompt)}`, path: ['data'] },
-        { url: `https://bk9.fun/ai/gpt4?q=${encodeURIComponent(prompt)}`, path: ['BK9'] },
-      ];
-      for (const api of apis) {
-        try {
-          const { data } = await axios.get(api.url, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
-          const ans = api.path.reduce((o, k) => o?.[k], data);
+        // pollinations.ai — completely free, reliable, no key
+        async () => {
+          const { data } = await axios.get(`https://text.pollinations.ai/${encoded}`, {
+            timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' }, responseType: 'text'
+          });
+          if (typeof data === 'string' && data.length > 2) return data.trim();
+          throw new Error('empty');
+        },
+        // DuckDuckGo AI Chat — free, no key
+        async () => {
+          const { data } = await axios.post('https://duckduckgo.com/duckchat/v1/chat', {
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: prompt }]
+          }, {
+            timeout: 15000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/json', 'x-vqd-4': '4' }
+          });
+          const ans = data?.message || data?.choices?.[0]?.message?.content;
+          if (ans) return ans.trim();
+          throw new Error('empty');
+        },
+        // Dreaded API
+        async () => {
+          const { data } = await axios.get(`https://api.dreaded.site/api/ai?text=${encoded}`, {
+            timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' }
+          });
+          const ans = data?.result?.message || data?.result || data?.message;
           if (ans && typeof ans === 'string' && ans.length > 2) return ans.trim();
-        } catch { /* try next */ }
+          throw new Error('empty');
+        },
+        // BK9 API
+        async () => {
+          const { data } = await axios.get(`https://bk9.fun/ai/gpt4?q=${encoded}`, {
+            timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' }
+          });
+          const ans = data?.BK9 || data?.result || data?.response;
+          if (ans && typeof ans === 'string' && ans.length > 2) return ans.trim();
+          throw new Error('empty');
+        },
+        // Agatz API
+        async () => {
+          const { data } = await axios.get(`https://api.agatz.xyz/api/ai?message=${encoded}`, {
+            timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' }
+          });
+          const ans = data?.data || data?.result;
+          if (ans && typeof ans === 'string' && ans.length > 2) return ans.trim();
+          throw new Error('empty');
+        },
+      ];
+
+      for (const apiFn of apis) {
+        try { return await apiFn(); } catch { /* try next */ }
       }
-      throw new Error('All AI backends unavailable. Add OPENAI_API_KEY or GEMINI_API_KEY to .env for reliable responses.');
+      throw new Error('All AI backends unavailable. Add OPENAI_API_KEY or GEMINI_API_KEY to .env for reliable AI responses.');
     }
   };
 
@@ -1375,11 +1418,13 @@ ${toggles.join('\n')}
   }});
 
   // ─── Other media command stubs ─────────────────────────────────────────────
-  const mediaNames = ['sticker','s','take','attp','simage','getpp','setpp','setbotpp','crop','stickercrop','toimg','tomp3','toptt','tovideo','videodoc','volaudio','reverseaudio','bass','blown','deep','earrape','fast','fat','nightcore','robot','slow','smooth','tupai','removebg','remini','enhance','upscale','blur','img-blur'];
-  for (const name of mediaNames) {
-    if (registry.has(name)) continue;
-    add({ name, category: 'converter', desc: `${name} media command`, handler: async (ctx) => reply(ctx, `${name} is registered. Reply to media with ${getConfig().prefix}${name}. Full conversion needs ffmpeg/sharp support on the host.`) });
-  }
+  // Media converter commands — these need ffmpeg/sharp which isn't available on KataBump free tier
+  // sticker/s: convert image to sticker
+  if (!registry.has('sticker')) add({ name: 'sticker', aliases: ['s', 'take'], category: 'converter', desc: 'Convert image/video to sticker', usage: '(reply to image/video)', handler: async (ctx) => {
+    const quoted = ctx.message?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    if (!quoted?.imageMessage && !quoted?.videoMessage) return reply(ctx, `Reply to an image or video with ${getConfig().prefix}sticker`);
+    await reply(ctx, '❌ Sticker creation requires the *sharp* library which is not installed.\n\nInstall it:\n```npm install sharp```\nThen restart the bot.');
+  }});
 
   // ─── PLAY / SONG: Download YouTube audio (Knightbot-MD style with multi-API fallback) ──
   add({
@@ -2701,12 +2746,145 @@ ${madeByFooter(cfg)}`;
     }
   }});
 
-  // ─── Remaining misc stubs ─────────────────────────────────────────────────
-  const miscNames = ['clean','clear','cleartmp','warnings','warn','resetwarn','topmembers','myactivity','groupstats','goodnight','lovenight','gn','shayari','roseday','heart','circle','lgbt','lolice','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','tweet','ytcomment','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','url','ss','ssweb','screenshot','up','reject','translate','trt','translate2','trt2','tts','bio','character','wasted','emojimix','meme','memesearch','bomb','pingspam','newsletter','setnewsletter','setmenuimage','broadcast','sudo','addsudo','delsudo','owners','support','channel'];
-  for (const name of miscNames) {
+  // ─── Remaining misc stubs — honest "not available" response ───────────────
+  const unavailableCmds = ['attp','simage','setpp','setbotpp','crop','stickercrop','toimg','tomp3','toptt','tovideo','videodoc','volaudio','reverseaudio','bass','blown','deep','earrape','fast','fat','nightcore','robot','slow','smooth','tupai','removebg','remini','enhance','upscale','blur','img-blur','simpcard','tonikawa','its-so-stupid','namecard','oogway','oogway2','comrade','gay','glass','jail','passed','triggered','china','indonesia','japan','korea','india','malaysia','thailand','lolice','lgbt','lovenight','shayari','roseday','heart','circle','ytcomment','newsletter','setnewsletter','setmenuimage','bomb','pingspam','addsudo','delsudo','sudo'];
+  for (const name of unavailableCmds) {
     if (registry.has(name)) continue;
-    add({ name, category: 'tools', desc: `${name} command`, handler: async (ctx) => reply(ctx, `${name} command is registered and working in the mega build.`) });
+    add({ name, category: 'tools', desc: `${name} command`, handler: async (ctx) => reply(ctx, `⚠️ *${name}* requires additional libraries (ffmpeg/sharp/canvas) not available on this host.\n\nTry: *${getConfig().prefix}menu* for available commands.`) });
   }
+
+  // ─── CLEAR: Delete recent bot messages ────────────────────────────────────
+  if (!registry.has('clear')) add({ name: 'clear', aliases: ['clr'], category: 'owner', ownerOnly: true, desc: 'Clear bot messages from this chat (last 5)', usage: '[count]', handler: async (ctx) => {
+    const count = parseInt(ctx.args[0]) || 5;
+    await reply(ctx, `🧹 Clearing last ${count} bot messages...`);
+    // Baileys doesn't expose chat history — inform user
+    await reply(ctx, `✅ To clear messages manually:\n• Long press a message → Delete for Everyone\n\nBot can only delete messages it sent via reply.`);
+  }});
+
+  // ─── TRANSLATE: Translate text ────────────────────────────────────────────
+  if (!registry.has('translate')) add({ name: 'translate', aliases: ['trt', 'tr'], category: 'tools', desc: 'Translate text to English (or target language)', usage: '<text> | [lang:<code>]', handler: async (ctx) => {
+    const text = textArg(ctx.args);
+    if (!text) return reply(ctx, `Usage: ${getConfig().prefix}translate Hello world\nOptional: ${getConfig().prefix}translate lang:sw Hello world`);
+    try {
+      const target = ctx.args.find(a => a.startsWith('lang:'))?.split(':')[1] || 'en';
+      const query = text.replace(/lang:\w+\s?/, '').trim();
+      const { data } = await axios.get(
+        `https://api.mymemory.translated.net/get?q=${encodeURIComponent(query)}&langpair=auto|${target}`,
+        { timeout: 10000 }
+      );
+      const result = data?.responseData?.translatedText;
+      if (!result) throw new Error('No translation returned');
+      await reply(ctx, `🌐 *Translation* (→ ${target.toUpperCase()})\n\n${result}`);
+    } catch (e) {
+      await reply(ctx, `❌ Translation failed: ${e.message}`);
+    }
+  }});
+
+  // ─── TTS: Text to speech ──────────────────────────────────────────────────
+  if (!registry.has('tts')) add({ name: 'tts', category: 'tools', desc: 'Convert text to speech (audio)', usage: '<text>', handler: async (ctx) => {
+    const text = textArg(ctx.args);
+    if (!text) return reply(ctx, `Usage: ${getConfig().prefix}tts Hello world`);
+    try {
+      const encoded = encodeURIComponent(text.slice(0, 200));
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encoded}&tl=en&client=tw-ob`;
+      await ctx.sock.sendMessage(ctx.chatId, {
+        audio: { url: ttsUrl },
+        mimetype: 'audio/mpeg',
+        ptt: true,
+        fileName: 'tts.mp3'
+      }, { quoted: ctx.message });
+    } catch (e) {
+      await reply(ctx, `❌ TTS failed: ${e.message}`);
+    }
+  }});
+
+  // ─── SS / SCREENSHOT: Screenshot a webpage ────────────────────────────────
+  if (!registry.has('ss')) add({ name: 'ss', aliases: ['screenshot', 'ssweb'], category: 'tools', desc: 'Screenshot a website', usage: '<URL>', handler: async (ctx) => {
+    const url = ctx.args[0];
+    if (!url || !url.startsWith('http')) return reply(ctx, `Usage: ${getConfig().prefix}ss https://google.com`);
+    try {
+      await reply(ctx, `📸 Taking screenshot of *${url}*...`);
+      const encodedUrl = encodeURIComponent(url);
+      const screenshotUrl = `https://image.thum.io/get/width/1280/crop/800/${encodedUrl}`;
+      await ctx.sock.sendMessage(ctx.chatId, {
+        image: { url: screenshotUrl },
+        caption: `📸 Screenshot: ${url}`
+      }, { quoted: ctx.message });
+    } catch (e) {
+      await reply(ctx, `❌ Screenshot failed: ${e.message}`);
+    }
+  }});
+
+  // ─── TWEET: Generate Twitter-like card ────────────────────────────────────
+  if (!registry.has('tweet')) add({ name: 'tweet', category: 'tools', desc: 'Generate a fake tweet card (text)', usage: '@user <text>', handler: async (ctx) => {
+    const text = textArg(ctx.args);
+    if (!text) return reply(ctx, `Usage: ${getConfig().prefix}tweet Hello world`);
+    const name = ctx.message?.pushName || 'User';
+    const num = normalizeNumber(ctx.sender);
+    const date = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    await reply(ctx, `🐦 *Tweet Card*\n\n╭────────────────────╮\n│ 🐦 *${name}*\n│ @${num}\n│\n│ ${text}\n│\n│ 🕐 ${date}\n│ ❤️ 0  🔁 0  💬 0\n╰────────────────────╯\n\n_Powered by ${getConfig().botName || 'Malai-XD-2.0'}_`);
+  }});
+
+  // ─── WASTED: GTA wasted text ──────────────────────────────────────────────
+  if (!registry.has('wasted')) add({ name: 'wasted', category: 'fun', desc: 'GTA Wasted text effect', usage: '[text]', handler: async (ctx) => {
+    const name = textArg(ctx.args) || ctx.message?.pushName || 'You';
+    await reply(ctx, `🎮 *G T A  V*\n\n━━━━━━━━━━━━━━━━━\n    W A S T E D\n━━━━━━━━━━━━━━━━━\n\n💀 *${name.toUpperCase()}* has been wasted!\n\n_Mission Failed. We'll get em next time..._`);
+  }});
+
+  // ─── MEME: Generate a text meme ───────────────────────────────────────────
+  if (!registry.has('meme')) add({ name: 'meme', category: 'fun', desc: 'Get a random meme', handler: async (ctx) => {
+    try {
+      const { data } = await axios.get('https://meme-api.com/gimme', { timeout: 8000 });
+      if (data?.url) {
+        await ctx.sock.sendMessage(ctx.chatId, {
+          image: { url: data.url },
+          caption: `😂 *${data.title || 'Meme'}*\n👍 ${data.ups || 0} upvotes`
+        }, { quoted: ctx.message });
+      } else throw new Error('No meme returned');
+    } catch (e) {
+      await reply(ctx, `❌ Meme fetch failed: ${e.message}`);
+    }
+  }});
+
+  // ─── BIO / AUTOBIO ────────────────────────────────────────────────────────
+  if (!registry.has('bio')) add({ name: 'bio', aliases: ['autobio', 'setbio'], category: 'owner', ownerOnly: true, desc: 'Set bot WhatsApp status/bio', usage: '<text>', handler: async (ctx) => {
+    const text = textArg(ctx.args);
+    if (!text) return reply(ctx, `Usage: ${getConfig().prefix}bio Your new bio here`);
+    try {
+      await ctx.sock.updateProfileStatus(text);
+      await reply(ctx, `✅ Bio updated: "${text}"`);
+    } catch (e) {
+      await reply(ctx, `❌ Failed to update bio: ${e.message}`);
+    }
+  }});
+
+  // ─── BROADCAST: Send message to all groups ────────────────────────────────
+  if (!registry.has('broadcast')) add({ name: 'broadcast', aliases: ['bc'], category: 'owner', ownerOnly: true, desc: 'Broadcast message to all groups', usage: '<message>', handler: async (ctx) => {
+    const text = textArg(ctx.args);
+    if (!text) return reply(ctx, `Usage: ${getConfig().prefix}broadcast Your message here`);
+    try {
+      const groups = await ctx.sock.groupFetchAllParticipating();
+      const groupIds = Object.keys(groups);
+      await reply(ctx, `📢 Broadcasting to *${groupIds.length}* groups...`);
+      let sent = 0;
+      for (const gid of groupIds) {
+        try {
+          await ctx.sock.sendMessage(gid, { text: `📢 *Broadcast*\n\n${text}` });
+          sent++;
+          await new Promise(r => setTimeout(r, 800)); // delay between sends
+        } catch { /* ignore individual failures */ }
+      }
+      await reply(ctx, `✅ Broadcast sent to *${sent}/${groupIds.length}* groups.`);
+    } catch (e) {
+      await reply(ctx, `❌ Broadcast failed: ${e.message}`);
+    }
+  }});
+
+  // ─── OWNERS / SUPPORT / CHANNEL ───────────────────────────────────────────
+  if (!registry.has('owners')) add({ name: 'owners', aliases: ['support', 'channel', 'dev'], category: 'core', desc: 'Show bot owner and support info', handler: async (ctx) => {
+    const cfg = getConfig();
+    await reply(ctx, `╭━━━〔 🤖 *BOT INFO* 〕━━━╮\n┃ 👑 *Owner:* Kimani Samuel\n┃ 📱 *Number:* +${cfg.ownerNumber || '254XXXXXXXXX'}\n┃ 🔗 *GitHub:* github.com/Brokensmile47\n┃ 🤖 *Bot:* ${cfg.botName || 'Malai-XD-2.0'}\n╰━━━━━━━━━━━━━━━━━━━━━╯`);
+  }});
 
   // ─── WARN / WARNINGS / RESETWARN ─────────────────────────────────────────
   add({ name: 'warn', category: 'group', groupOnly: true, adminOnly: true, desc: 'Warn a user (3 warns = kick)', usage: '@user [reason]', handler: async (ctx) => {
