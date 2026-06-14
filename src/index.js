@@ -811,8 +811,15 @@ async function handleMessage(sock, rawMessage) {
 
   if (!cfg.publicMode && !isOwnerJid(sender) && !fromMe) return;
 
-  const body = rawText.slice(prefix.length).trim();
-  if (!body) return;
+  // Use commandText (has correct prefix) when bot trigger fired, else rawText
+  const parseFrom = isBotTrigger ? commandText : rawText;
+  const body = parseFrom.slice(prefix.length).trim();
+  // If "bot" typed alone with nothing after → show menu
+  if (!body) {
+    const menuCmd = registry.get('menu');
+    if (menuCmd) await menuCmd.handler({ sock, chatId, sender, message, args: [], isGroup, fromMe, pushName: message?.pushName || '' });
+    return;
+  }
   let [cmdNameRaw, ...args] = body.split(/\s+/);
   let cmdName = cmdNameRaw.toLowerCase();
   let command = registry.get(cmdName);
